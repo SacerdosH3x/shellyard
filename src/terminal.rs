@@ -75,6 +75,9 @@ pub struct Terminal {
     pub allow_clipboard: bool,
     /// The process has been waited for (no zombie left behind).
     reaped: bool,
+    /// Answers OpenSSH's password/passphrase prompts with saved secrets.
+    #[cfg(unix)]
+    askpass: Option<crate::askpass::Server>,
 }
 
 impl SshSpec {
@@ -102,6 +105,16 @@ impl SshSpec {
     }
 }
 
+/// The host name OpenSSH will connect to after applying ~/.ssh/config (an
+/// alias's `HostName`), as printed by `ssh -G`. Password prompts name it.
+fn resolved_hostname(cmd: &CommandBuilder) -> Option<String> {
+    let argv = cmd.get_argv();
+    // Same options and destination, minus the program name; sftp's -P is ssh's -p.
+    let args: Vec<std::ffi::OsString> = argv.iter().skip(1).map(|a| if a == "-P" { "-p".into() } else { a.clone() }).collect();
+    let out = std::process::Command::new("ssh").arg("-G").args(&args).stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("hostname ").map(str::to_string))
+}
+
 /// The host part of the destination as each OpenSSH program expects it: `ssh`
 /// takes a bare IPv6 address (`::1`), while `sftp` treats `:` as the start of
 /// a path unless the address is in brackets (`[::1]`).
@@ -124,6 +137,8 @@ pub struct SshSpec {
     /// Extra arguments placed before the destination, built by Shellyard from validated values.
     pub options: Vec<String>,
     pub temp_files: Vec<std::path::PathBuf>,
+    /// Saved password / passphrase to answer OpenSSH's prompts with.
+    pub secrets: crate::askpass::Secrets,
 }
 
 impl Terminal {
@@ -190,6 +205,8 @@ impl Terminal {
             temp_files: Vec::new(),
             allow_clipboard: false,
             reaped: false,
+            #[cfg(unix)]
+            askpass: None,
         })
     }
 
@@ -215,13 +232,37 @@ impl Terminal {
         }
         let mut cmd = CommandBuilder::new(spec.program);
         cmd.args(spec.args());
-        match Self::spawn(cmd, title, ctx) {
+        let SshSpec { temp_files, mut secrets, .. } = spec;
+        let result = (|| {
+            #[cfg(unix)]
+            let askpass = if secrets.is_empty() {
+                None
+            } else {
+                if secrets.password.is_some() {
+                    secrets.hosts.extend(resolved_hostname(&cmd));
+                }
+                let server = crate::askpass::Server::start(&crate::store::run_dir(), std::mem::take(&mut secrets))?;
+                for (k, v) in server.env()? {
+                    cmd.env(k, v);
+                }
+                Some(server)
+            };
+            #[allow(unused_mut)]
+            let mut t = Self::spawn(cmd, title, ctx)?;
+            #[cfg(unix)]
+            {
+                t.askpass = askpass;
+            }
+            Ok(t)
+        })();
+        drop(secrets);
+        match result {
             Ok(mut t) => {
-                t.temp_files = spec.temp_files;
+                t.temp_files = temp_files;
                 Ok(t)
             }
             Err(e) => {
-                crate::store::remove_temp_files(&spec.temp_files);
+                crate::store::remove_temp_files(&temp_files);
                 Err(e)
             }
         }
@@ -280,6 +321,10 @@ impl Terminal {
         }
         if !self.reaped {
             self.reaped = matches!(self.child.try_wait(), Ok(Some(_)) | Err(_));
+        }
+        #[cfg(unix)]
+        {
+            self.askpass = None;
         }
     }
 
@@ -855,7 +900,7 @@ pub fn default_shell() -> String {
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }
 
-fn which(name: &str) -> Option<String> {
+pub(crate) fn which(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
     // GUI apps on macOS get a minimal PATH; also look in the usual places.
@@ -1027,6 +1072,7 @@ mod tests {
             identity: Some(key.clone()),
             options,
             temp_files: Vec::new(),
+            secrets: Default::default(),
         };
         // `ssh -G` prints the resolved configuration without connecting.
         let out = std::process::Command::new("ssh").arg("-G").args(spec.args()).output().expect("ssh not installed");
@@ -1085,6 +1131,7 @@ mod tests {
             identity: None,
             options: Vec::new(),
             temp_files: Vec::new(),
+            secrets: Default::default(),
         };
         let out = std::process::Command::new("ssh").arg("-G").args(spec.args()).output().expect("ssh not installed");
         assert!(String::from_utf8_lossy(&out.stdout).contains("hostname 2001:db8::5"));
@@ -1136,6 +1183,7 @@ mod tests {
             identity: None,
             options: Vec::new(),
             temp_files: Vec::new(),
+            secrets: Default::default(),
         };
         assert!(Terminal::openssh(spec("ops", "-oProxyCommand=touch /tmp/x"), "x".into(), &ctx).is_err());
         assert!(Terminal::openssh(spec("-l", "host"), "x".into(), &ctx).is_err());

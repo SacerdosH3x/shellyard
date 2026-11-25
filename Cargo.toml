@@ -23,6 +23,7 @@ egui-phosphor = "0.7"
 zeroize = "1"
 dirs = "5"
 rfd = "0.15"
+libc = "0.2"
 
 [profile.release]
 lto = true

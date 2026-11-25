@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::model::{safe_arg, ForwardKind, SshKey, Tunnel};
+use crate::model::{safe_arg, Credential, ForwardKind, Secret, Tunnel};
 
 pub(super) fn expand_home(p: &str) -> PathBuf {
     match (p.strip_prefix("~/"), dirs::home_dir()) {
@@ -29,11 +29,30 @@ fn read_public(private: &Path) -> Option<String> {
     std::fs::read_to_string(pub_path(private)).ok().map(|s| s.trim().to_string()).filter(|s| s.starts_with("ssh-") || s.starts_with("ecdsa-"))
 }
 
-fn key_public(k: &SshKey) -> Option<String> {
-    k.public.clone().or_else(|| match &k.source {
-        KeySource::File(p) => read_public(&expand_home(p)),
-        KeySource::Embedded(_) => None,
+fn key_public(c: &Credential) -> Option<String> {
+    c.public.clone().or_else(|| match &c.source {
+        Some(KeySource::File(p)) => read_public(&expand_home(p)),
+        _ => None,
     })
+}
+
+/// A masked text field with a show/hide toggle.
+pub(super) fn secret_field(ui: &mut Ui, text: &mut Zeroizing<String>, show: &mut bool, hint: &str, width: f32) {
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut **text).password(!*show).hint_text(hint).desired_width(width - 30.0));
+        let glyph = if *show { icon::EYE_SLASH } else { icon::EYE };
+        if widgets::icon_button(ui, glyph, if *show { "Hide" } else { "Show" }).clicked() {
+            *show = !*show;
+        }
+    });
+}
+
+/// `Err` if `s` cannot be passed to OpenSSH as a user name.
+pub(super) fn check_user(s: &str) -> Result<(), String> {
+    if s.starts_with('-') || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("User name must not contain spaces or start with '-'.".into());
+    }
+    Ok(())
 }
 
 /// Private keys in ~/.ssh, recognised by a matching `.pub` file.
@@ -92,12 +111,100 @@ pub(crate) fn is_loopback(addr: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Forms
 
-#[derive(Default)]
-pub(crate) struct KeyForm {
-    name: String,
-    path: String,
-    embed: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyMode {
+    None,
+    File,
+    Vault,
+}
+
+pub(crate) struct CredentialForm {
+    /// Name, user name and id; secrets live in the fields below while editing.
+    c: Credential,
+    is_new: bool,
+    password: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
+    key_mode: KeyMode,
+    /// The key file (or, for a key stored in the vault, a file to import).
+    key_path: String,
+    /// Editing a credential whose key is already stored in the vault.
+    has_embedded: bool,
+    show: bool,
     error: Option<String>,
+}
+
+impl CredentialForm {
+    fn new() -> Self {
+        Self::edit(&Credential { id: Host::new_id(), ..Credential::default() }).with_new()
+    }
+
+    fn with_new(mut self) -> Self {
+        self.is_new = true;
+        self
+    }
+
+    fn edit(c: &Credential) -> Self {
+        let (key_mode, key_path, has_embedded) = match &c.source {
+            None => (KeyMode::None, String::new(), false),
+            Some(KeySource::File(p)) => (KeyMode::File, p.clone(), false),
+            Some(KeySource::Embedded(_)) => (KeyMode::Vault, String::new(), true),
+        };
+        let reveal = |s: &Option<Secret>| Zeroizing::new(s.as_ref().map(|s| s.expose().to_string()).unwrap_or_default());
+        Self {
+            c: Credential { id: c.id.clone(), name: c.name.clone(), username: c.username.clone(), ..Credential::default() },
+            is_new: false,
+            password: reveal(&c.password),
+            passphrase: reveal(&c.passphrase),
+            key_mode,
+            key_path,
+            has_embedded,
+            show: false,
+            error: None,
+        }
+    }
+
+    /// Builds the credential to save; `existing` supplies a key already stored in the vault.
+    fn validate(&self, existing: Option<&Credential>) -> Result<Credential, String> {
+        let username = self.c.username.trim().to_string();
+        check_user(&username)?;
+        let path = expand_home(self.key_path.trim());
+        let read_key = || -> Result<Zeroizing<String>, String> {
+            if !path.is_file() {
+                return Err(format!("{} is not a file.", path.display()));
+            }
+            let contents = Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| format!("Cannot read the key: {e}"))?);
+            if !contents.contains("PRIVATE KEY") {
+                return Err("That file is not a private key (pick the file without .pub).".into());
+            }
+            Ok(contents)
+        };
+        let (source, public) = match self.key_mode {
+            KeyMode::None => (None, None),
+            KeyMode::File => {
+                read_key()?;
+                (Some(KeySource::File(collapse_home(&path))), read_public(&path))
+            }
+            KeyMode::Vault if self.key_path.trim().is_empty() => match existing.and_then(|c| c.source.as_ref()) {
+                Some(src @ KeySource::Embedded(_)) => (Some(src.clone()), existing.and_then(|c| c.public.clone())),
+                _ => return Err("Pick the key file to store in the vault.".into()),
+            },
+            KeyMode::Vault => (Some(KeySource::Embedded(read_key()?.to_string())), read_public(&path)),
+        };
+        let password = Secret::non_empty(&self.password);
+        if source.is_none() && password.is_none() && username.is_empty() {
+            return Err("Add a user name, a password or an SSH key.".into());
+        }
+        let mut name = self.c.name.trim().to_string();
+        if name.is_empty() {
+            name = match (&source, username.is_empty()) {
+                (Some(_), _) if !self.key_path.trim().is_empty() => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                (_, false) => username.clone(),
+                _ => "credential".into(),
+            };
+        }
+        let passphrase = if source.is_some() { Secret::non_empty(&self.passphrase) } else { None };
+        Ok(Credential { id: self.c.id.clone(), name, username, password, source, passphrase, public })
+    }
 }
 
 pub(crate) struct NewKeyForm {
@@ -168,16 +275,21 @@ impl TunnelForm {
 
 impl App {
     // -----------------------------------------------------------------------
-    // SSH keys
+    // Credentials
 
-    pub(super) fn keys_page(&mut self, ui: &mut Ui) {
+    pub(super) fn credentials_page(&mut self, ui: &mut Ui) {
         page_frame(ui, |ui, _w| {
-            page_header(ui, icon::KEY, "SSH keys", "Keys used to sign in to hosts. Pick one per host in Edit host.");
+            page_header(
+                ui,
+                icon::IDENTIFICATION_CARD,
+                "Credentials",
+                "User names, passwords, SSH keys and passphrases, encrypted in the vault. Pick one per host in Edit host.",
+            );
             ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &format!("  {}  Add key file…  ", icon::PLUS)).clicked() {
-                    self.key_form = Some(KeyForm::default());
+                if widgets::primary_button(ui, &format!("  {}  New credential  ", icon::PLUS)).clicked() {
+                    self.credential_form = Some(CredentialForm::new());
                 }
-                if ui.button(format!("{}  Generate new key", icon::STAR_FOUR)).clicked() {
+                if ui.button(format!("{}  Generate SSH key", icon::STAR_FOUR)).clicked() {
                     self.new_key_form = Some(NewKeyForm { name: "shellyard_ed25519".into(), comment: "shellyard".into(), error: None });
                 }
             });
@@ -185,33 +297,36 @@ impl App {
 
             let mut copy: Option<Option<String>> = None;
             let mut delete: Option<String> = None;
-            if self.inventory.keys.is_empty() {
-                ui.label(RichText::new("No keys added. Hosts without a key use your SSH agent and ~/.ssh defaults.").color(theme::FAINT));
+            let mut edit: Option<String> = None;
+            if self.inventory.credentials.is_empty() {
+                ui.label(RichText::new("No credentials yet. Hosts without one use your SSH agent and ~/.ssh defaults, and ask for passwords in the terminal.").color(theme::FAINT));
             }
-            for k in &self.inventory.keys {
-                let used = self.inventory.hosts.iter().filter(|h| h.key_id.as_ref() == Some(&k.id)).count();
+            for c in &self.inventory.credentials {
+                let used = self.inventory.hosts.iter().filter(|h| h.credential_id.as_ref() == Some(&c.id)).count();
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                        widgets::icon_tile(ui, r, icon::KEY, theme::BLUE, theme::BLUE_BG);
+                        let glyph = if c.source.is_some() { icon::KEY } else { icon::IDENTIFICATION_CARD };
+                        widgets::icon_tile(ui, r, glyph, theme::BLUE, theme::BLUE_BG);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(RichText::new(&k.name).strong().color(theme::TEXT));
-                            let (src, missing) = match &k.source {
-                                KeySource::File(p) => (format!("File · {p}"), !expand_home(p).is_file()),
-                                KeySource::Embedded(_) => ("Stored in the encrypted vault".to_string(), false),
-                            };
-                            ui.label(RichText::new(format!("{src} · used by {used} host{}", if used == 1 { "" } else { "s" })).size(11.0).color(theme::FAINT));
-                            if missing {
-                                ui.label(RichText::new(format!("{}  File not found (still being generated?)", icon::WARNING)).size(11.0).color(theme::DANGER));
+                            ui.label(RichText::new(&c.name).strong().color(theme::TEXT));
+                            ui.label(RichText::new(format!("{} · used by {used} host{}", c.summary(), if used == 1 { "" } else { "s" })).size(11.0).color(theme::FAINT));
+                            if let Some(KeySource::File(p)) = &c.source {
+                                if !expand_home(p).is_file() {
+                                    ui.label(RichText::new(format!("{}  Key file not found", icon::WARNING)).size(11.0).color(theme::DANGER));
+                                }
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if delete_menu(ui, "Remove this key from Shellyard? Key files on disk are not touched.") {
-                                delete = Some(k.id.clone());
+                            if delete_menu(ui, "Delete this credential? Key files on disk are not touched.") {
+                                delete = Some(c.id.clone());
                             }
-                            if ui.button(format!("{}  Copy public key", icon::COPY)).clicked() {
-                                copy = Some(key_public(k));
+                            if widgets::icon_button(ui, icon::PENCIL_SIMPLE, "Edit").clicked() {
+                                edit = Some(c.id.clone());
+                            }
+                            if c.source.is_some() && ui.button(format!("{}  Copy public key", icon::COPY)).clicked() {
+                                copy = Some(key_public(c));
                             }
                         });
                     });
@@ -222,17 +337,17 @@ impl App {
             // Keys found in ~/.ssh that are not registered yet.
             let known: Vec<PathBuf> = self
                 .inventory
-                .keys
+                .credentials
                 .iter()
-                .filter_map(|k| match &k.source {
-                    KeySource::File(p) => Some(expand_home(p)),
+                .filter_map(|c| match &c.source {
+                    Some(KeySource::File(p)) => Some(expand_home(p)),
                     _ => None,
                 })
                 .collect();
             let found: Vec<PathBuf> = detected_keys().into_iter().filter(|p| !known.contains(p)).collect();
             let mut add: Option<PathBuf> = None;
             if !found.is_empty() {
-                section_label(ui, None, "Found in ~/.ssh");
+                section_label(ui, None, "SSH keys found in ~/.ssh");
                 for p in &found {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon::KEY).color(theme::FAINT));
@@ -248,10 +363,10 @@ impl App {
             card(ui, |ui| {
                 ui.label(RichText::new("How sign-in works").strong().color(theme::TEXT));
                 for line in [
-                    "No key picked: OpenSSH uses your SSH agent and the default keys in ~/.ssh.",
-                    "Key file: Shellyard stores only the path and passes it with -i.",
-                    "Stored in vault: the key is encrypted in the vault. While a session runs it is written to a private file (0600) and wiped when the tab closes.",
-                    "Passphrases and passwords are typed into the terminal and never stored by Shellyard.",
+                    "A credential can hold a user name, a password, an SSH key and the key's passphrase. Leave out what you don't need.",
+                    "A host can also have its own password (Edit host); it wins over the credential's.",
+                    "Saved passwords and passphrases are handed to OpenSSH only when it asks for them, for that host and that key. If one is wrong, OpenSSH asks again in the terminal.",
+                    "Key file: only the path is stored. Stored in vault: the key is encrypted in the vault and written to a private file (0600) only while a session runs.",
                     "To put a public key on a server, right-click the host → Install SSH key on host (runs ssh-copy-id).",
                 ] {
                     ui.horizontal_wrapped(|ui| {
@@ -263,14 +378,19 @@ impl App {
 
             if let Some(p) = add {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.inventory.keys.push(SshKey { id: Host::new_id(), name, public: read_public(&p), source: KeySource::File(collapse_home(&p)) });
+                self.inventory.credentials.push(Credential::key(name, KeySource::File(collapse_home(&p)), read_public(&p)));
                 self.dirty = true;
             }
+            if let Some(id) = edit {
+                if let Some(c) = self.inventory.credentials.iter().find(|c| c.id == id) {
+                    self.credential_form = Some(CredentialForm::edit(c));
+                }
+            }
             if let Some(id) = delete {
-                self.inventory.keys.retain(|k| k.id != id);
+                self.inventory.credentials.retain(|c| c.id != id);
                 for h in &mut self.inventory.hosts {
-                    if h.key_id.as_ref() == Some(&id) {
-                        h.key_id = None;
+                    if h.credential_id.as_ref() == Some(&id) {
+                        h.credential_id = None;
                     }
                 }
                 self.dirty = true;
@@ -286,51 +406,70 @@ impl App {
         });
     }
 
-    pub(super) fn key_form_ui(&mut self, ctx: &egui::Context) {
-        let Some(form) = self.key_form.as_mut() else { return };
+    pub(super) fn credential_form_ui(&mut self, ctx: &egui::Context) {
+        let Some(form) = self.credential_form.as_mut() else { return };
         let (mut save, mut close) = (false, false);
-        egui::Window::new("Add SSH key")
+        egui::Window::new(if form.is_new { "New credential" } else { "Edit credential" })
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(440.0)
+            .default_width(460.0)
             .show(ctx, |ui| {
-                egui::Grid::new("keyform").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("Key file");
+                egui::Grid::new("credform").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(egui::TextEdit::singleline(&mut form.c.name).hint_text("prod admin").desired_width(270.0));
+                    ui.end_row();
+                    ui.label("User name");
+                    ui.add(egui::TextEdit::singleline(&mut form.c.username).hint_text("optional, e.g. ops or CORP\\ops").desired_width(270.0));
+                    ui.end_row();
+                    ui.label("Password");
+                    secret_field(ui, &mut form.password, &mut form.show, "optional", 270.0);
+                    ui.end_row();
+                    ui.label("SSH key");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut form.path).hint_text("~/.ssh/id_ed25519").desired_width(240.0));
-                        if ui.button("Browse…").clicked() {
-                            let start = dirs::home_dir().map(|h| h.join(".ssh")).unwrap_or_default();
-                            if let Some(p) = rfd::FileDialog::new().set_directory(start).set_title("Choose a private key").pick_file() {
-                                if form.name.is_empty() {
-                                    form.name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                }
-                                form.path = collapse_home(&p);
-                            }
+                        for (mode, label) in [(KeyMode::None, "None"), (KeyMode::File, "Key file"), (KeyMode::Vault, "Stored in vault")] {
+                            ui.selectable_value(&mut form.key_mode, mode, label);
                         }
                     });
                     ui.end_row();
-                    ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut form.name).hint_text("work laptop key").desired_width(240.0));
-                    ui.end_row();
+                    if form.key_mode != KeyMode::None {
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            let hint = if form.key_mode == KeyMode::Vault && form.has_embedded {
+                                "keep the stored key, or pick a file to replace it"
+                            } else {
+                                "~/.ssh/id_ed25519"
+                            };
+                            ui.add(egui::TextEdit::singleline(&mut form.key_path).hint_text(hint).desired_width(200.0));
+                            if ui.button("Browse…").clicked() {
+                                let start = dirs::home_dir().map(|h| h.join(".ssh")).unwrap_or_default();
+                                if let Some(p) = rfd::FileDialog::new().set_directory(start).set_title("Choose a private key").pick_file() {
+                                    if form.c.name.trim().is_empty() {
+                                        form.c.name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    }
+                                    form.key_path = collapse_home(&p);
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Passphrase");
+                        secret_field(ui, &mut form.passphrase, &mut form.show, "only if the key has one", 270.0);
+                        ui.end_row();
+                    }
                 });
                 ui.add_space(4.0);
-                ui.checkbox(&mut form.embed, "Copy the key into the encrypted vault");
-                ui.label(
-                    RichText::new(if form.embed {
-                        "The key travels with your vault (backups, other computers). The original file can then be deleted."
-                    } else {
-                        "Only the path is stored. The file must stay where it is."
-                    })
-                    .size(11.0)
-                    .color(theme::FAINT),
-                );
+                let note = match form.key_mode {
+                    KeyMode::None => "Without a key, OpenSSH also tries your SSH agent and ~/.ssh keys.",
+                    KeyMode::File => "Only the path is stored. The file must stay where it is.",
+                    KeyMode::Vault => "The key is copied into the encrypted vault and travels with it (backups, other computers).",
+                };
+                ui.label(RichText::new(note).size(11.0).color(theme::FAINT));
                 if let Some(e) = &form.error {
                     ui.label(RichText::new(e.as_str()).color(theme::DANGER));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if widgets::primary_button(ui, "  Add key  ").clicked() {
+                    if widgets::primary_button(ui, "  Save  ").clicked() {
                         save = true;
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -340,33 +479,21 @@ impl App {
             });
 
         if save {
-            let path = expand_home(form.path.trim());
-            let result = (|| -> Result<SshKey, String> {
-                if !path.is_file() {
-                    return Err(format!("{} is not a file.", path.display()));
-                }
-                let contents = Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| format!("Cannot read the key: {e}"))?);
-                if !contents.contains("PRIVATE KEY") {
-                    return Err("That file is not a private key (pick the file without .pub).".into());
-                }
-                let name = if form.name.trim().is_empty() {
-                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "key".into())
-                } else {
-                    form.name.trim().to_string()
-                };
-                let source = if form.embed { KeySource::Embedded(contents.to_string()) } else { KeySource::File(collapse_home(&path)) };
-                Ok(SshKey { id: Host::new_id(), name, source, public: read_public(&path) })
-            })();
-            match result {
-                Ok(k) => {
-                    self.inventory.keys.push(k);
+            let existing = self.inventory.credentials.iter().find(|c| c.id == form.c.id);
+            match form.validate(existing) {
+                Ok(c) => {
+                    if let Some(slot) = self.inventory.credentials.iter_mut().find(|x| x.id == c.id) {
+                        *slot = c;
+                    } else {
+                        self.inventory.credentials.push(c);
+                    }
                     self.dirty = true;
-                    self.key_form = None;
+                    self.credential_form = None;
                 }
                 Err(e) => form.error = Some(e),
             }
         } else if close {
-            self.key_form = None;
+            self.credential_form = None;
         }
     }
 

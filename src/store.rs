@@ -98,8 +98,8 @@ fn save_to(path: &std::path::Path, password: &str, inventory: &Inventory) -> Res
     Ok(())
 }
 
-/// Private directory for short-lived key files.
-fn run_dir() -> PathBuf {
+/// Private directory for short-lived key files, askpass sockets and .rdp files.
+pub fn run_dir() -> PathBuf {
     vault_path().parent().map(|p| p.join("run")).unwrap_or_else(|| PathBuf::from("run"))
 }
 
@@ -171,16 +171,33 @@ pub fn remove_temp_files(files: &[PathBuf]) {
     }
 }
 
-/// Removes key files left behind by a crash. Only files Shellyard itself
-/// creates (`key-*`) are touched, in case the directory is shared.
+/// Removes files left behind by a crash. Only what Shellyard itself creates
+/// (`key-*`, `rdp-*` files and `ask-*` socket folders) is touched, in case the
+/// directory is shared.
 pub fn clean_run_dir() {
-    remove_temp_files(&own_temp_files(&run_dir()));
+    let dir = run_dir();
+    remove_temp_files(&own_temp_files(&dir));
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && e.file_name().to_string_lossy().starts_with("ask-") {
+            let _ = std::fs::remove_file(e.path().join("s"));
+            let _ = std::fs::remove_dir(e.path());
+        }
+    }
 }
 
 fn own_temp_files(dir: &std::path::Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .map(|entries| {
-            entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("key-")).map(|e| e.path()).collect()
+            entries
+                .flatten()
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                    !is_dir && (name.starts_with("key-") || name.starts_with("rdp-"))
+                })
+                .map(|e| e.path())
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -211,16 +228,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
         let path = dir.join("sub").join("t.vault");
         let mut inv = Inventory::sample();
-        inv.keys.push(crate::model::SshKey {
-            id: "k".into(),
-            name: "k".into(),
-            source: crate::model::KeySource::Embedded("-----BEGIN OPENSSH PRIVATE KEY-----SECRETKEYDATA".into()),
-            public: None,
+        inv.credentials.push(crate::model::Credential {
+            password: Some(crate::model::Secret::new("PASSWORDDATA")),
+            passphrase: Some(crate::model::Secret::new("PHRASEDATA")),
+            ..crate::model::Credential::key("k", crate::model::KeySource::Embedded("-----BEGIN OPENSSH PRIVATE KEY-----SECRETKEYDATA".into()), None)
         });
+        inv.hosts[0].password = Some(crate::model::Secret::new("HOSTPWDATA"));
         save_to(&path, "a long test password", &inv).unwrap();
         save_to(&path, "a long test password", &inv).unwrap(); // replaces cleanly
         let raw = std::fs::read(&path).unwrap();
-        for needle in ["pg-primary", "198.51.100", "SECRETKEYDATA", "systemctl"] {
+        for needle in ["pg-primary", "198.51.100", "SECRETKEYDATA", "systemctl", "PASSWORDDATA", "PHRASEDATA", "HOSTPWDATA"] {
             assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle} found in plaintext");
         }
         #[cfg(unix)]
@@ -316,7 +333,32 @@ mod tests {
         let v1 = r#"{"version":1,"hosts":[{"id":"1","name":"a","address":"h","port":22,"user":"u","protocols":["Ssh"],"folder":"","favorite":false}]}"#;
         let inv: Inventory = serde_json::from_str(v1).unwrap();
         assert_eq!(inv.hosts.len(), 1);
-        assert!(inv.keys.is_empty() && inv.notes.is_empty() && inv.tunnels.is_empty());
-        assert!(inv.hosts[0].key_id.is_none());
+        assert!(inv.credentials.is_empty() && inv.notes.is_empty() && inv.tunnels.is_empty());
+        assert!(inv.hosts[0].credential_id.is_none());
+        assert_eq!(inv.hosts[0].rdp_port, 3389);
+    }
+
+    /// Version 2 stored SSH keys as `keys` and hosts pointed at them with
+    /// `key_id`; they must come back as credentials.
+    #[test]
+    fn version_2_keys_become_credentials() {
+        let v2 = r#"{"version":2,"hosts":[{"id":"1","name":"a","address":"h","port":22,"user":"u","protocols":["Ssh"],"folder":"","favorite":false,"key_id":"k1"}],
+            "keys":[{"id":"k1","name":"laptop","source":{"File":"~/.ssh/id_ed25519"},"public":"ssh-ed25519 AAAA"}]}"#;
+        let inv: Inventory = serde_json::from_str(v2).unwrap();
+        assert_eq!(inv.hosts[0].credential_id.as_deref(), Some("k1"));
+        let c = &inv.credentials[0];
+        assert_eq!(c.name, "laptop");
+        assert!(matches!(&c.source, Some(crate::model::KeySource::File(p)) if p == "~/.ssh/id_ed25519"));
+        assert!(c.password.is_none() && c.passphrase.is_none() && c.username.is_empty());
+        // Saved again, it uses the new names.
+        let json = serde_json::to_string(&inv).unwrap();
+        assert!(json.contains("\"credentials\"") && json.contains("\"credential_id\"") && !json.contains("\"keys\""));
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_debug_output() {
+        let mut inv = Inventory::sample();
+        inv.hosts[0].password = Some(crate::model::Secret::new("HOSTPWDATA"));
+        assert!(!format!("{inv:?}").contains("HOSTPWDATA"));
     }
 }

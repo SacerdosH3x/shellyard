@@ -35,15 +35,17 @@ See [SECURITY.md](SECURITY.md) for the threat model, the analysis results and kn
 2. **Vault (mostly done):** create/unlock screen, sealed inventory saved in the background on every change, lock button, change master password. *Still to do:* unlock-policy setting (each launch, once per session, new device only), which needs the OS keychain.
 3. **Local terminal (done):** PTY via portable-pty, VT grid via alacritty_terminal, drawn with the egui painter, keyboard input, resize, scrollback, OSC title, mouse selection (drag, word, line) and copy, mouse wheel in full-screen programs. *Still to do:* mouse click reporting (tmux/vim mouse mode), search in scrollback, font size setting.
 4. **SSH (interim):** hosts open the system OpenSSH client (`ssh` / `sftp`) inside a terminal tab, so known_hosts, agents and keys already work.
-   - **SSH keys (done):** Keys page; per-host key picker. A key is either a file path or stored encrypted in the vault (written to a 0600 temp file only while a session runs, wiped on close, leftovers wiped at startup). Generate with ssh-keygen in a tab; install on a host with ssh-copy-id.
-   - *Still to do:* russh for saved passwords and auto-login, reconnect without a new process.
+   - **SSH keys (done):** part of Credentials. A key is either a file path or stored encrypted in the vault (written to a 0600 temp file only while a session runs, wiped on close, leftovers wiped at startup). Generate with ssh-keygen in a tab; install on a host with ssh-copy-id.
+   - **Credentials (done):** user name, password, SSH key and passphrase in one reusable credential; per-host password. Saved secrets reach OpenSSH through SSH_ASKPASS (see SECURITY.md).
+   - *Still to do:* jump hosts (ProxyJump) in the host editor, reconnect without a new process.
 4b. **Tunnels (done):** local (-L), remote (-R) and SOCKS (-D) forwards run as `ssh -N` with ExitOnForwardFailure and keepalives; start/stop, status, live console for passphrase prompts, auto-start on unlock.
 4c. **Notes (done):** notes in the vault, optionally linked to a host, searchable, paste into a terminal tab.
 5. **Tabs and panes (partial):** tabs, reconnect, keyboard shortcuts. *Still to do:* split up to 16 panes, broadcast input.
 6. **SFTP:** dual-pane browser, drag-and-drop transfers, chmod, inline editor, live tail. (Today: the `sftp` CLI in a tab.)
 7. **Organize and personalize (partial):** host editor (folder, type, tags, protocols, favorite), command palette. *Still to do:* drag-and-drop folders, custom colors and icons, themes, keybinding editor, PuTTY/WinSCP/MobaXterm import.
 8. **Backup:** encrypted export and import, Git or cloud-folder sync of ciphertext.
-9. **Later:** RDP, Docker management, auto-update. The Docker page is a placeholder in the UI.
+9. **RDP (done, external client):** FreeRDP in a tab (signs in with the saved password, asks about certificates there), or Windows App on macOS / Remmina on Linux. Picked in Settings → Remote desktop.
+10. **Later:** Docker management, auto-update. The Docker page is a placeholder in the UI.
 
 ## Running
 

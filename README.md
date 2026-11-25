@@ -9,7 +9,7 @@ No webview, no account, no server, no telemetry.</p>
 > **Shellyard is in beta.** It works for daily use, but expect rough edges and
 > keep a backup of your vault file. Please [report problems](https://github.com/SacerdosH3x/shellyard/issues).
 
-Shellyard keeps your hosts, SSH keys, tunnels and notes in one file encrypted
+Shellyard keeps your hosts, passwords, SSH keys, tunnels and notes in one file encrypted
 with your master password (Argon2id + AES-256-GCM), and opens them in fast
 native terminal tabs. It is written in Rust with [egui](https://github.com/emilk/egui)
 and uses your system OpenSSH, so `known_hosts`, agents and `~/.ssh/config` keep working.
@@ -31,6 +31,7 @@ entry. You can [read it first](install.sh). Uninstall with
 **Homebrew:**
 
 ```sh
+brew trust sacerdosh3x/tap        # once: Homebrew asks before using a third-party tap
 brew install sacerdosh3x/tap/shellyard
 ```
 
@@ -52,13 +53,14 @@ On Debian/Ubuntu run `scripts/linux-deps.sh` first.
 
 - **Hosts:** folders, favorites, tags, search, command palette (⌘⇧P), recent connections.
 - **Terminals:** SSH, SFTP and local shells in tabs, with truecolor, scrollback, mouse selection and copy, and bracketed paste.
-- **SSH keys:** use your `~/.ssh` keys or store keys inside the vault, generate ed25519 keys, install them with `ssh-copy-id`.
+- **Credentials:** user names, passwords, SSH keys and key passphrases, reusable across hosts; a host can also have its own password. Saved secrets are handed to OpenSSH only when it asks for them. Generate ed25519 keys and install them with `ssh-copy-id`.
+- **RDP:** opens Windows hosts in FreeRDP (signing in with the saved password) or Windows App / Remmina.
 - **Tunnels:** local (`-L`), remote (`-R`) and SOCKS (`-D`) forwards with start/stop, status, a console for prompts, and auto-start.
 - **Notes:** encrypted notes and command snippets, linked to hosts, pasted into a terminal with one click.
 - **Security:** auto-lock when idle, secrets wiped from memory, OSC 52 clipboard writes blocked by default.
 
-Planned: split panes and broadcast input, a graphical SFTP browser, a built-in SSH
-client for saved passwords, Docker, RDP, encrypted backup and sync. See
+Planned: split panes and broadcast input, a graphical SFTP browser, jump hosts,
+Docker, encrypted backup and sync. See
 [docs/PLAN.md](docs/PLAN.md).
 
 ## Security

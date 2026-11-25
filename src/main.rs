@@ -1,5 +1,7 @@
 mod app;
+mod askpass;
 mod model;
+mod rdp;
 mod store;
 mod terminal;
 mod theme;
@@ -9,6 +11,11 @@ mod widgets;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Started by OpenSSH as SSH_ASKPASS: answer and exit, no window.
+    #[cfg(unix)]
+    if let Some(code) = askpass::run_if_requested() {
+        std::process::exit(code);
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1320.0, 840.0])
         .with_min_inner_size([860.0, 520.0])

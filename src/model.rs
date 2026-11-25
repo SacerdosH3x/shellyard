@@ -69,9 +69,20 @@ pub struct Host {
     /// Unix seconds of the last connection started from Shellyard.
     #[serde(default)]
     pub last_connected: Option<u64>,
-    /// SSH key to sign in with. `None` means the SSH agent and default keys.
+    /// Credential to sign in with (user name, password, SSH key). `None`
+    /// means the SSH agent and default keys. Called `key_id` before version 3.
+    #[serde(default, alias = "key_id")]
+    pub credential_id: Option<String>,
+    /// A password for this host only. It wins over the credential's password.
     #[serde(default)]
-    pub key_id: Option<String>,
+    pub password: Option<Secret>,
+    /// Port for RDP; `port` is the SSH/SFTP port.
+    #[serde(default = "default_rdp_port")]
+    pub rdp_port: u16,
+}
+
+pub fn default_rdp_port() -> u16 {
+    3389
 }
 
 impl Host {
@@ -113,6 +124,39 @@ impl Host {
     }
 }
 
+/// A password or passphrase. Never printed (even in debug output) and wiped
+/// from memory when dropped. Stored as a plain string inside the encrypted vault.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// `None` for an empty string, so empty form fields store nothing.
+    pub fn non_empty(s: &str) -> Option<Self> {
+        (!s.is_empty()).then(|| Self::new(s))
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Where a private key lives.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum KeySource {
@@ -142,14 +186,57 @@ impl Drop for KeySource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SshKey {
+/// What a host signs in with: any mix of a user name, a password, and an SSH
+/// key with its passphrase. Before version 3 these were SSH keys only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Credential {
     pub id: String,
     pub name: String,
-    pub source: KeySource,
+    /// Used when the host's own user field is empty.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: Option<Secret>,
+    /// The SSH key, if any.
+    #[serde(default)]
+    pub source: Option<KeySource>,
+    /// Passphrase of the SSH key, if it has one and it is saved.
+    #[serde(default)]
+    pub passphrase: Option<Secret>,
     /// OpenSSH public key line, if known.
     #[serde(default)]
     pub public: Option<String>,
+}
+
+impl Credential {
+    /// A credential holding only an SSH key.
+    pub fn key(name: impl Into<String>, source: KeySource, public: Option<String>) -> Self {
+        Self { id: Host::new_id(), name: name.into(), source: Some(source), public, ..Self::default() }
+    }
+
+    /// A short list of what it contains, e.g. "user ops · password · key file".
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.username.is_empty() {
+            parts.push(format!("user {}", self.username));
+        }
+        if self.password.is_some() {
+            parts.push("password".into());
+        }
+        match &self.source {
+            Some(KeySource::File(p)) => parts.push(format!("key {p}")),
+            Some(KeySource::Embedded(_)) => parts.push("key stored in vault".into()),
+            None => {}
+        }
+        if self.passphrase.is_some() {
+            parts.push("passphrase".into());
+        }
+        if parts.is_empty() {
+            "empty".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -241,7 +328,9 @@ pub fn safe_arg(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-pub const INVENTORY_VERSION: u32 = 2;
+/// 3: SSH keys became credentials (user, password, key, passphrase); hosts
+/// got a password and an RDP port.
+pub const INVENTORY_VERSION: u32 = 3;
 
 /// Preferences stored inside the vault.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,11 +341,37 @@ pub struct Settings {
     /// Let programs in a terminal write to the clipboard with OSC 52. Off by
     /// default: a compromised server could otherwise plant a command there.
     pub allow_osc52: bool,
+    /// Which program opens RDP connections.
+    pub rdp_client: RdpClient,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_lock_minutes: 15, allow_osc52: false }
+        Self { auto_lock_minutes: 15, allow_osc52: false, rdp_client: RdpClient::Auto }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RdpClient {
+    /// FreeRDP when a password is saved (it can sign in with it), otherwise
+    /// the system's RDP app.
+    #[default]
+    Auto,
+    /// FreeRDP (xfreerdp / sdl-freerdp) in a terminal tab.
+    FreeRdp,
+    /// Windows App / Microsoft Remote Desktop on macOS, Remmina on Linux.
+    System,
+}
+
+impl RdpClient {
+    pub const ALL: [RdpClient; 3] = [RdpClient::Auto, RdpClient::FreeRdp, RdpClient::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RdpClient::Auto => "Automatic",
+            RdpClient::FreeRdp => "FreeRDP",
+            RdpClient::System => if cfg!(target_os = "macos") { "Windows App" } else { "Remmina" },
+        }
     }
 }
 
@@ -265,8 +380,9 @@ pub struct Inventory {
     #[serde(default = "default_version")]
     pub version: u32,
     pub hosts: Vec<Host>,
-    #[serde(default)]
-    pub keys: Vec<SshKey>,
+    /// Called `keys` before version 3.
+    #[serde(default, alias = "keys")]
+    pub credentials: Vec<Credential>,
     #[serde(default)]
     pub notes: Vec<Note>,
     #[serde(default)]
@@ -281,7 +397,7 @@ fn default_version() -> u32 {
 
 impl Default for Inventory {
     fn default() -> Self {
-        Self { version: INVENTORY_VERSION, hosts: Vec::new(), keys: Vec::new(), notes: Vec::new(), tunnels: Vec::new(), settings: Settings::default() }
+        Self { version: INVENTORY_VERSION, hosts: Vec::new(), credentials: Vec::new(), notes: Vec::new(), tunnels: Vec::new(), settings: Settings::default() }
     }
 }
 
@@ -298,7 +414,15 @@ fn host(name: &str, address: &str, user: &str, folder: &str, kind: HostKind, fav
         kind,
         tags: Vec::new(),
         last_connected: None,
-        key_id: None,
+        credential_id: None,
+        password: None,
+        rdp_port: default_rdp_port(),
+    }
+}
+
+impl Inventory {
+    pub fn credential(&self, id: Option<&String>) -> Option<&Credential> {
+        id.and_then(|id| self.credentials.iter().find(|c| &c.id == id))
     }
 }
 
@@ -311,6 +435,8 @@ impl Inventory {
         staging.protocols.push(Protocol::Sftp);
         let mut backup = host("backup", "192.0.2.40", "backup", "Infra", Server, false);
         backup.protocols = vec![Protocol::Sftp];
+        let mut windows = host("win-desktop", "192.0.2.50", "Administrator", "Infra", Windows, false);
+        windows.protocols = vec![Protocol::Rdp];
         let inv = Self {
             version: INVENTORY_VERSION,
             hosts: vec![
@@ -324,6 +450,7 @@ impl Inventory {
                 host("staging-db", "198.51.100.41", "dba", "Staging", Database, false),
                 host("bastion", "203.0.113.10", "ops", "Infra", Bastion, false),
                 backup,
+                windows,
             ],
             ..Self::default()
         };
