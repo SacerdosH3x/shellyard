@@ -1,0 +1,2024 @@
+use std::collections::{BTreeMap, HashSet};
+use std::thread::JoinHandle;
+
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Frame, Key, Layout, Margin, Modifiers, Pos2, Rect, RichText, Rounding,
+    Sense, Stroke, Ui, Vec2, ViewportCommand,
+};
+use egui_phosphor::regular as icon;
+use zeroize::{Zeroize, Zeroizing};
+
+use std::collections::HashMap;
+
+use crate::model::{Host, HostKind, Inventory, KeySource, Protocol};
+use crate::terminal::{self, SshSpec, Terminal};
+
+mod pages;
+use pages::{KeyForm, NewKeyForm, TunnelForm};
+use crate::widgets::{self, host_card, section_label};
+use crate::{store, theme};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Home,
+    Tunnels,
+    Keys,
+    Notes,
+    Docker,
+    Settings,
+}
+
+#[derive(Clone)]
+enum Action {
+    Connect(String, Protocol),
+    OpenLocal(String),
+    NewHost(Option<String>),
+    EditHost(String),
+    DeleteHost(String),
+    Duplicate(String),
+    ToggleFavorite(String),
+    SelectTab(Option<usize>),
+    CloseTab(usize),
+    Reconnect(usize),
+    ToggleSidebar,
+    ToggleFolder(String),
+    ToggleHomeFolder(String),
+    Page(Page),
+    Lock,
+    OpenPalette,
+    NewNote(Option<String>),
+    PasteNote(String, usize),
+    NewTunnel(Option<String>),
+    EditTunnel(String),
+    StartTunnel(String),
+    StopTunnel(String),
+    InstallKey(String),
+    GenerateKey(String, String),
+}
+
+struct Session {
+    host_id: Option<String>,
+    label: String,
+    glyph: &'static str,
+    term: Terminal,
+}
+
+// Password fields are wiped from memory when the screen goes away.
+enum LockScreen {
+    Unlock { password: Zeroizing<String>, error: Option<String>, focused: bool },
+    Create { password: Zeroizing<String>, confirm: Zeroizing<String>, sample: bool, error: Option<String>, focused: bool },
+}
+
+impl LockScreen {
+    fn unlock() -> Self {
+        LockScreen::Unlock { password: Zeroizing::default(), error: None, focused: false }
+    }
+}
+
+/// An unlock running on a background thread (Argon2 takes a moment).
+struct Unlocking {
+    password: Zeroizing<String>,
+    job: JoinHandle<anyhow::Result<Inventory>>,
+}
+
+struct HostForm {
+    host: Host,
+    is_new: bool,
+    port: String,
+    tags: String,
+    error: Option<String>,
+    confirm_delete: bool,
+}
+
+struct Palette {
+    query: String,
+    selected: usize,
+    opened: bool,
+}
+
+#[derive(Default)]
+struct PasswordChange {
+    current: Zeroizing<String>,
+    new: Zeroizing<String>,
+    confirm: Zeroizing<String>,
+    message: Option<(String, bool)>,
+}
+
+pub struct App {
+    lock: Option<LockScreen>,
+    password: Option<Zeroizing<String>>,
+    inventory: Inventory,
+    dirty: bool,
+    saving: Option<JoinHandle<anyhow::Result<()>>>,
+    toast: Option<(String, bool, f64)>,
+    page: Page,
+    sidebar_open: bool,
+    filter: Option<Protocol>,
+    sidebar_search: String,
+    home_search: String,
+    collapsed: HashSet<String>,
+    home_collapsed: HashSet<String>,
+    sessions: Vec<Session>,
+    active: Option<usize>,
+    focus_active: bool,
+    host_form: Option<HostForm>,
+    palette: Option<Palette>,
+    shells: Vec<(String, String)>,
+    pw_change: PasswordChange,
+    dirty_seen: Option<f64>,
+    key_form: Option<KeyForm>,
+    new_key_form: Option<NewKeyForm>,
+    tunnel_form: Option<TunnelForm>,
+    tunnels_running: HashMap<String, Terminal>,
+    tunnel_console: Option<String>,
+    note_selected: Option<String>,
+    note_search: String,
+    unlocking: Option<Unlocking>,
+    /// `ctx.input().time` of the last keyboard or mouse input, for auto-lock.
+    last_input: f64,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::install(&cc.egui_ctx);
+        store::migrate_legacy();
+        store::clean_run_dir();
+        let lock = if store::exists() {
+            LockScreen::unlock()
+        } else {
+            LockScreen::Create {
+                password: Zeroizing::default(),
+                confirm: Zeroizing::default(),
+                sample: true,
+                error: None,
+                focused: false,
+            }
+        };
+        Self {
+            lock: Some(lock),
+            password: None,
+            inventory: Inventory::default(),
+            dirty: false,
+            saving: None,
+            toast: None,
+            page: Page::Home,
+            sidebar_open: true,
+            filter: None,
+            sidebar_search: String::new(),
+            home_search: String::new(),
+            collapsed: HashSet::new(),
+            home_collapsed: HashSet::new(),
+            sessions: Vec::new(),
+            active: None,
+            focus_active: false,
+            host_form: None,
+            palette: None,
+            shells: terminal::available_shells(),
+            pw_change: PasswordChange::default(),
+            dirty_seen: None,
+            key_form: None,
+            new_key_form: None,
+            tunnel_form: None,
+            tunnels_running: HashMap::new(),
+            tunnel_console: None,
+            note_selected: None,
+            note_search: String::new(),
+            unlocking: None,
+            last_input: 0.0,
+        }
+    }
+
+    fn toast(&mut self, ctx: &egui::Context, msg: impl Into<String>, error: bool) {
+        self.toast = Some((msg.into(), error, ctx.input(|i| i.time)));
+    }
+
+    fn host(&self, id: &str) -> Option<&Host> {
+        self.inventory.hosts.iter().find(|h| h.id == id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence
+
+    fn poll_save(&mut self, ctx: &egui::Context) {
+        if let Some(h) = &self.saving {
+            if h.is_finished() {
+                let h = self.saving.take().unwrap();
+                let failed = match h.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(format!("Could not save vault, retrying: {e}")),
+                    Err(_) => Some("Could not save vault, retrying: save thread panicked".to_string()),
+                };
+                if let Some(msg) = failed {
+                    self.toast(ctx, msg, true);
+                    // Keep the changes pending and retry in about five seconds.
+                    self.dirty = true;
+                    self.dirty_seen = Some(ctx.input(|i| i.time) + 4.0);
+                }
+            }
+        }
+        let now = ctx.input(|i| i.time);
+        if self.dirty {
+            let seen = *self.dirty_seen.get_or_insert(now);
+            // Coalesce bursts of edits (typing a note) into one save per second.
+            if now - seen < 1.0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1050));
+                return;
+            }
+        }
+        if self.dirty && self.saving.is_none() {
+            self.dirty_seen = None;
+            if let Some(pw) = &self.password {
+                let pw = pw.clone();
+                let inv = self.inventory.clone();
+                self.dirty = false;
+                self.saving = Some(std::thread::spawn(move || store::save(&pw, &inv)));
+            }
+        }
+    }
+
+    /// Waits for any in-flight save, then saves synchronously if needed.
+    /// Returns false if changes could not be written.
+    fn flush_save(&mut self) -> bool {
+        if let Some(h) = self.saving.take() {
+            if !matches!(h.join(), Ok(Ok(()))) {
+                self.dirty = true;
+            }
+        }
+        if self.dirty {
+            if let Some(pw) = &self.password {
+                if store::save(pw, &self.inventory).is_err() {
+                    return false;
+                }
+                self.dirty = false;
+            }
+        }
+        true
+    }
+
+    fn lock_now(&mut self, ctx: &egui::Context) {
+        if !self.flush_save() {
+            self.toast(ctx, "Locked, but the last changes could not be saved to the vault file.", true);
+        }
+        self.dirty = false;
+        self.dirty_seen = None;
+        self.password = None;
+        self.inventory = Inventory::default();
+        self.host_form = None;
+        self.palette = None;
+        self.key_form = None;
+        self.new_key_form = None;
+        self.tunnel_form = None;
+        self.note_selected = None;
+        self.pw_change = PasswordChange::default();
+        self.lock = Some(LockScreen::unlock());
+    }
+
+    // -----------------------------------------------------------------------
+    // Actions
+
+    fn apply(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
+        for a in actions {
+            match a {
+                Action::Connect(id, proto) => self.connect(ctx, &id, proto),
+                Action::OpenLocal(shell) => match Terminal::local(&shell, ctx) {
+                    Ok(term) => {
+                        let label = term.title.clone();
+                        self.open_session(Session { host_id: None, label, glyph: icon::TERMINAL, term });
+                    }
+                    Err(e) => self.toast(ctx, format!("Could not start {shell}: {e}"), true),
+                },
+                Action::NewHost(folder) => {
+                    let host = Host {
+                        id: Host::new_id(),
+                        name: String::new(),
+                        address: String::new(),
+                        port: 22,
+                        user: String::new(),
+                        protocols: vec![Protocol::Ssh],
+                        folder: folder.unwrap_or_default(),
+                        favorite: false,
+                        kind: HostKind::Server,
+                        tags: Vec::new(),
+                        last_connected: None,
+                        key_id: None,
+                    };
+                    self.host_form = Some(HostForm::new(host, true));
+                }
+                Action::EditHost(id) => {
+                    if let Some(h) = self.host(&id).cloned() {
+                        self.host_form = Some(HostForm::new(h, false));
+                    }
+                }
+                Action::DeleteHost(id) => {
+                    if let Some(h) = self.host(&id).cloned() {
+                        let mut f = HostForm::new(h, false);
+                        f.confirm_delete = true;
+                        self.host_form = Some(f);
+                    }
+                }
+                Action::Duplicate(id) => {
+                    if let Some(h) = self.host(&id).cloned() {
+                        let mut copy = h;
+                        copy.id = Host::new_id();
+                        copy.name = format!("{} copy", copy.name);
+                        copy.favorite = false;
+                        copy.last_connected = None;
+                        self.host_form = Some(HostForm::new(copy, true));
+                    }
+                }
+                Action::ToggleFavorite(id) => {
+                    if let Some(h) = self.inventory.hosts.iter_mut().find(|h| h.id == id) {
+                        h.favorite = !h.favorite;
+                        self.dirty = true;
+                    }
+                }
+                Action::SelectTab(i) => {
+                    self.active = i.filter(|i| *i < self.sessions.len());
+                    if self.active.is_some() {
+                        self.focus_active = true;
+                    } else {
+                        self.page = Page::Home;
+                    }
+                }
+                Action::CloseTab(i) => {
+                    if i < self.sessions.len() {
+                        self.sessions.remove(i);
+                        self.active = match self.active {
+                            Some(a) if a == i => {
+                                if self.sessions.is_empty() {
+                                    None
+                                } else {
+                                    Some(i.min(self.sessions.len() - 1))
+                                }
+                            }
+                            Some(a) if a > i => Some(a - 1),
+                            other => other,
+                        };
+                        self.focus_active = self.active.is_some();
+                    }
+                }
+                Action::Reconnect(i) => {
+                    let host = self.sessions.get(i).and_then(|s| s.host_id.clone());
+                    let sftp = self.sessions.get(i).is_some_and(|s| s.label.ends_with("· sftp"));
+                    if let Some(id) = host {
+                        let before = self.sessions.len();
+                        self.connect(ctx, &id, if sftp { Protocol::Sftp } else { Protocol::Ssh });
+                        if self.sessions.len() > before {
+                            // Put the new session where the old one was.
+                            let new = self.sessions.pop().unwrap();
+                            self.sessions[i] = new;
+                            self.active = Some(i);
+                        }
+                    }
+                }
+                Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+                Action::ToggleFolder(p) => {
+                    if !self.collapsed.remove(&p) {
+                        self.collapsed.insert(p);
+                    }
+                }
+                Action::ToggleHomeFolder(p) => {
+                    if !self.home_collapsed.remove(&p) {
+                        self.home_collapsed.insert(p);
+                    }
+                }
+                Action::Page(p) => {
+                    self.page = p;
+                    self.active = None;
+                }
+                Action::Lock => self.lock_now(ctx),
+                Action::OpenPalette => self.palette = Some(Palette { query: String::new(), selected: 0, opened: true }),
+                Action::NewNote(host_id) => {
+                    let note = crate::model::Note {
+                        id: Host::new_id(),
+                        title: String::new(),
+                        body: String::new(),
+                        host_id,
+                        updated: now(),
+                    };
+                    self.note_selected = Some(note.id.clone());
+                    self.inventory.notes.insert(0, note);
+                    self.dirty = true;
+                    self.page = Page::Notes;
+                    self.active = None;
+                }
+                Action::PasteNote(id, tab) => {
+                    let body = self.inventory.notes.iter().find(|n| n.id == id).map(|n| n.body.clone());
+                    if let (Some(body), Some(s)) = (body, self.sessions.get_mut(tab)) {
+                        s.term.paste(&body);
+                        self.active = Some(tab);
+                        self.focus_active = true;
+                    }
+                }
+                Action::NewTunnel(host_id) => self.tunnel_form = Some(TunnelForm::new_for(host_id, &self.inventory)),
+                Action::EditTunnel(id) => {
+                    if let Some(t) = self.inventory.tunnels.iter().find(|t| t.id == id) {
+                        self.tunnel_form = Some(TunnelForm::edit(t.clone()));
+                    }
+                }
+                Action::StartTunnel(id) => self.start_tunnel(ctx, &id),
+                Action::StopTunnel(id) => {
+                    self.tunnels_running.remove(&id);
+                }
+                Action::InstallKey(host_id) => self.install_key(ctx, &host_id),
+                Action::GenerateKey(name, comment) => self.generate_key(ctx, &name, &comment),
+            }
+        }
+    }
+
+    fn open_session(&mut self, s: Session) {
+        self.sessions.push(s);
+        self.active = Some(self.sessions.len() - 1);
+        self.focus_active = true;
+    }
+
+    fn connect(&mut self, ctx: &egui::Context, id: &str, proto: Protocol) {
+        let Some(h) = self.host(id).cloned() else { return };
+        let result = match proto {
+            Protocol::Ssh | Protocol::Sftp => {
+                let program = if proto == Protocol::Ssh { "ssh" } else { "sftp" };
+                self.ssh_spec(&h, program, Vec::new()).and_then(|spec| Terminal::openssh(spec, h.name.clone(), ctx))
+            }
+            Protocol::Rdp => {
+                self.toast(ctx, "RDP sessions are not built yet (see docs/PLAN.md, milestone 9).", true);
+                return;
+            }
+            Protocol::Local => Terminal::local(&terminal::default_shell(), ctx),
+        };
+        match result {
+            Ok(term) => {
+                let label = if proto == Protocol::Sftp { format!("{} · sftp", h.name) } else { h.name.clone() };
+                self.open_session(Session { host_id: Some(h.id.clone()), label, glyph: widgets::kind_icon(h.kind), term });
+                if let Some(h) = self.inventory.hosts.iter_mut().find(|x| x.id == id) {
+                    h.last_connected = Some(now());
+                    self.dirty = true;
+                }
+            }
+            Err(e) => self.toast(ctx, format!("Could not connect to {}: {e}", h.name), true),
+        }
+    }
+
+    /// Builds the OpenSSH invocation for a host, resolving its SSH key.
+    fn ssh_spec(&self, h: &Host, program: &'static str, options: Vec<String>) -> anyhow::Result<SshSpec> {
+        let mut spec = SshSpec {
+            program,
+            user: h.user.clone(),
+            address: h.address.clone(),
+            port: h.port,
+            identity: None,
+            options,
+            temp_files: Vec::new(),
+        };
+        if let Some(key_id) = &h.key_id {
+            let key = self
+                .inventory
+                .keys
+                .iter()
+                .find(|k| &k.id == key_id)
+                .ok_or_else(|| anyhow::anyhow!("the SSH key assigned to {} was deleted; pick another in Edit host", h.name))?;
+            match &key.source {
+                KeySource::File(path) => {
+                    let path = pages::expand_home(path);
+                    if !path.is_file() {
+                        anyhow::bail!("key file {} not found", path.display());
+                    }
+                    spec.identity = Some(path);
+                }
+                KeySource::Embedded(pem) => {
+                    let files = store::write_temp_key(pem, key.public.as_deref())?;
+                    spec.identity = Some(files[0].clone());
+                    spec.temp_files = files;
+                }
+            }
+        }
+        Ok(spec)
+    }
+
+    fn start_tunnel(&mut self, ctx: &egui::Context, id: &str) {
+        let Some(t) = self.inventory.tunnels.iter().find(|t| t.id == id).cloned() else { return };
+        let Some(h) = self.host(&t.host_id).cloned() else {
+            self.toast(ctx, format!("Tunnel {}: its host was deleted.", t.name), true);
+            return;
+        };
+        let mut options: Vec<String> = ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        options.extend(t.ssh_args());
+        match self.ssh_spec(&h, "ssh", options).and_then(|spec| Terminal::openssh(spec, t.name.clone(), ctx)) {
+            Ok(term) => {
+                self.tunnels_running.insert(t.id.clone(), term);
+            }
+            Err(e) => self.toast(ctx, format!("Tunnel {}: {e}", t.name), true),
+        }
+    }
+
+    fn install_key(&mut self, ctx: &egui::Context, host_id: &str) {
+        let Some(h) = self.host(host_id).cloned() else { return };
+        let key = h.key_id.as_ref().and_then(|k| self.inventory.keys.iter().find(|x| &x.id == k)).cloned();
+        let Some(key) = key else {
+            self.toast(ctx, "Pick an SSH key for this host first (Edit host → SSH key).", true);
+            return;
+        };
+        if matches!(key.source, KeySource::Embedded(_)) && key.public.is_none() {
+            self.toast(ctx, "This key has no public key stored, so it cannot be installed.", true);
+            return;
+        }
+        match self.ssh_spec(&h, "ssh-copy-id", Vec::new()).and_then(|spec| Terminal::openssh(spec, format!("install key · {}", h.name), ctx)) {
+            Ok(term) => self.open_session(Session { host_id: None, label: format!("install key · {}", h.name), glyph: icon::KEY, term }),
+            Err(e) => self.toast(ctx, format!("Could not run ssh-copy-id: {e}"), true),
+        }
+    }
+
+    fn generate_key(&mut self, ctx: &egui::Context, name: &str, comment: &str) {
+        let Some(home) = dirs::home_dir() else { return };
+        let dir = home.join(".ssh");
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let path = dir.join(name);
+        // ssh-keygen asks for the passphrase itself, so it never passes through Shellyard.
+        let mut cmd = portable_pty::CommandBuilder::new("ssh-keygen");
+        cmd.args(["-t", "ed25519", "-C", comment, "-f"]);
+        cmd.arg(&path);
+        match Terminal::spawn(cmd, format!("new key · {name}"), ctx) {
+            Ok(term) => {
+                self.inventory.keys.push(crate::model::SshKey {
+                    id: Host::new_id(),
+                    name: name.to_string(),
+                    source: KeySource::File(pages::collapse_home(&path)),
+                    public: None,
+                });
+                self.dirty = true;
+                self.open_session(Session { host_id: None, label: format!("new key · {name}"), glyph: icon::KEY, term });
+            }
+            Err(e) => self.toast(ctx, format!("Could not run ssh-keygen: {e}"), true),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Top bar
+
+    fn top_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let bar = ui.interact(ui.max_rect(), egui::Id::new("titlebar-drag"), Sense::click_and_drag());
+        if bar.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+        if bar.double_clicked() {
+            let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+            ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!max));
+        }
+
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let home_active = self.active.is_none();
+            let (r, _) = tab_pill(ui, icon::HOUSE, "Home", home_active, false, "");
+            if r.clicked() {
+                actions.push(Action::SelectTab(None));
+            }
+            for (i, s) in self.sessions.iter().enumerate() {
+                let (r, close) = tab_pill(ui, s.glyph, &s.label, self.active == Some(i), true, &s.term.title);
+                if close.is_some_and(|c| c.clicked()) || r.middle_clicked() {
+                    actions.push(Action::CloseTab(i));
+                } else if r.clicked() {
+                    actions.push(Action::SelectTab(Some(i)));
+                }
+                r.context_menu(|ui| {
+                    if s.host_id.is_some() && ui.button(format!("{}  Reconnect", icon::ARROWS_CLOCKWISE)).clicked() {
+                        actions.push(Action::Reconnect(i));
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{}  Close", icon::X)).clicked() {
+                        actions.push(Action::CloseTab(i));
+                        ui.close_menu();
+                    }
+                });
+            }
+            ui.add_space(2.0);
+            let plus = widgets::icon_button(ui, icon::PLUS, "New local terminal");
+            let popup_id = ui.make_persistent_id("new-tab-menu");
+            if plus.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(popup_id));
+            }
+            egui::popup_below_widget(ui, popup_id, &plus, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(180.0);
+                for (name, path) in &self.shells {
+                    if ui.button(format!("{}  {name}", icon::TERMINAL)).clicked() {
+                        actions.push(Action::OpenLocal(path.clone()));
+                    }
+                }
+            });
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.menu_button(RichText::new(icon::DOTS_THREE).size(16.0), |ui| {
+                    ui.set_min_width(200.0);
+                    if ui.button(format!("{}  Add host", icon::PLUS)).clicked() {
+                        actions.push(Action::NewHost(None));
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{}  Toggle hosts sidebar", icon::SIDEBAR_SIMPLE)).clicked() {
+                        actions.push(Action::ToggleSidebar);
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{}  Settings", icon::GEAR)).clicked() {
+                        actions.push(Action::Page(Page::Settings));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}  Quit", icon::X)).clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                    }
+                });
+                if widgets::icon_button(ui, icon::LOCK_SIMPLE, "Lock vault").clicked() {
+                    actions.push(Action::Lock);
+                }
+                version_pill(ui);
+                if search_button(ui).clicked() {
+                    actions.push(Action::OpenPalette);
+                }
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Icon rail
+
+    fn rail(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let home = self.active.is_none() && self.page == Page::Home;
+            if rail_item(ui, icon::HOUSE, "Home", home).clicked() {
+                actions.push(Action::SelectTab(None));
+            }
+            if rail_item(ui, icon::HARD_DRIVES, "Hosts", self.sidebar_open).clicked() {
+                actions.push(Action::ToggleSidebar);
+            }
+            let running = self.tunnels_running.values().any(|t| !t.exited);
+            for (page, glyph, label) in [
+                (Page::Tunnels, icon::ARROWS_LEFT_RIGHT, "Tunnels"),
+                (Page::Keys, icon::KEY, "Keys"),
+                (Page::Notes, icon::NOTE, "Notes"),
+            ] {
+                let on = self.active.is_none() && self.page == page;
+                let r = rail_item(ui, glyph, label, on);
+                if page == Page::Tunnels && running {
+                    ui.painter().circle_filled(r.rect.right_top() + Vec2::new(-12.0, 10.0), 3.5, theme::ACCENT);
+                }
+                if r.clicked() {
+                    actions.push(Action::Page(page));
+                }
+            }
+            let docker = self.active.is_none() && self.page == Page::Docker;
+            if rail_item(ui, icon::CUBE, "Docker", docker).clicked() {
+                actions.push(Action::Page(Page::Docker));
+            }
+        });
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            let settings = self.active.is_none() && self.page == Page::Settings;
+            if rail_item(ui, icon::GEAR, "Settings", settings).clicked() {
+                actions.push(Action::Page(Page::Settings));
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Hosts sidebar
+
+    fn sidebar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Hosts").strong().size(14.0).color(theme::TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if widgets::icon_button(ui, icon::SIDEBAR_SIMPLE, "Hide sidebar").clicked() {
+                    actions.push(Action::ToggleSidebar);
+                }
+                if widgets::icon_button(ui, icon::PLUS, "Add host").clicked() {
+                    actions.push(Action::NewHost(None));
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Protocol filter.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = (ui.available_width() - 12.0) / 4.0;
+            for (label, f) in [("All", None), ("SSH", Some(Protocol::Ssh)), ("SFTP", Some(Protocol::Sftp)), ("RDP", Some(Protocol::Rdp))] {
+                if segment(ui, label, self.filter == f, w).clicked() {
+                    self.filter = f;
+                }
+            }
+        });
+        ui.add_space(6.0);
+        widgets::search_box(ui, &mut self.sidebar_search, "Search hosts / folders / tags…", 32.0, false, egui::Id::new("sidebar-search"));
+        ui.add_space(6.0);
+
+        let query = self.sidebar_search.trim().to_string();
+        let filter = self.filter;
+        let visible = |h: &Host| h.matches(&query) && filter.is_none_or(|p| h.has(p));
+        let hosts = &self.inventory.hosts;
+
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let mut favs: Vec<&Host> = hosts.iter().filter(|h| h.favorite && visible(h)).collect();
+            favs.sort_by_key(|h| h.name.to_lowercase());
+            if !favs.is_empty() {
+                section_label(ui, Some(icon::STAR), "Favorites");
+                for h in favs {
+                    let r = widgets::host_row(ui, h, 0.0);
+                    host_interact(r, h, actions);
+                }
+                ui.add_space(8.0);
+            }
+
+            let tree = Node::build(hosts, &visible);
+            let searching = !query.is_empty() || filter.is_some();
+            tree_ui(ui, &tree, "", 0, hosts, &self.collapsed, searching, actions);
+            if tree.count == 0 {
+                ui.add_space(12.0);
+                ui.label(RichText::new(if hosts.is_empty() { "No hosts yet." } else { "No hosts match." }).color(theme::FAINT));
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Pages
+
+    fn home(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let full = ui.available_width();
+            let w = (full - 48.0).clamp(280.0, 700.0);
+            let left = ((full - w) / 2.0).max(0.0);
+            ui.add_space(36.0);
+            ui.horizontal(|ui| {
+                ui.add_space(left);
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    self.home_column(ui, w, actions);
+                });
+            });
+            ui.add_space(40.0);
+        });
+    }
+
+    fn home_column(&mut self, ui: &mut Ui, w: f32, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+            widgets::icon_tile(ui, r, icon::TERMINAL_WINDOW, theme::ACCENT, theme::accent_soft());
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new("Where to?").size(17.0).strong().color(theme::TEXT));
+                ui.label(RichText::new("Search a host and press Enter, or pick something below.").size(11.5).color(theme::MUTED));
+            });
+        });
+        ui.add_space(12.0);
+
+        let search_id = egui::Id::new("home-search");
+        let resp = widgets::search_box(
+            ui,
+            &mut self.home_search,
+            "Search hosts by name, address, folder, tag or type…",
+            40.0,
+            true,
+            search_id,
+        );
+        let query = self.home_search.trim().to_string();
+        let hosts = &self.inventory.hosts;
+        let mut results: Vec<&Host> = hosts.iter().filter(|h| h.matches(&query)).collect();
+        results.sort_by_key(|h| (!h.favorite, h.name.to_lowercase()));
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !query.is_empty() {
+            if let Some(h) = results.first() {
+                actions.push(Action::Connect(h.id.clone(), default_protocol(h)));
+                self.home_search.clear();
+            }
+        }
+        ui.add_space(16.0);
+
+        if !query.is_empty() {
+            section_label(ui, Some(icon::MAGNIFYING_GLASS), &format!("Results ({})", results.len()));
+            if results.is_empty() {
+                ui.label(RichText::new("No hosts match.").color(theme::FAINT));
+            } else {
+                card_grid(ui, &results, w, actions);
+            }
+            return;
+        }
+
+        if hosts.is_empty() {
+            Frame::none().fill(theme::SURFACE).stroke(Stroke::new(1.0_f32, theme::BORDER)).rounding(8.0).inner_margin(20.0).show(ui, |ui| {
+                ui.set_width(w - 40.0);
+                ui.label(RichText::new("No hosts yet").strong().color(theme::TEXT));
+                ui.label(RichText::new("Add a server to connect over SSH or SFTP. Sign-in uses your SSH agent and keys, or asks in the terminal.").color(theme::MUTED));
+                ui.add_space(8.0);
+                if widgets::primary_button(ui, "  Add your first host  ").clicked() {
+                    actions.push(Action::NewHost(None));
+                }
+            });
+            ui.add_space(16.0);
+        }
+
+        let mut favs: Vec<&Host> = hosts.iter().filter(|h| h.favorite).collect();
+        favs.sort_by_key(|h| h.name.to_lowercase());
+        if !favs.is_empty() {
+            section_label(ui, Some(icon::STAR), "Favorites");
+            card_grid(ui, &favs, w, actions);
+            ui.add_space(14.0);
+        }
+
+        let mut recent: Vec<&Host> = hosts.iter().filter(|h| h.last_connected.is_some()).collect();
+        recent.sort_by_key(|h| std::cmp::Reverse(h.last_connected));
+        recent.truncate(4);
+        if !recent.is_empty() {
+            section_label(ui, Some(icon::CLOCK), "Recent");
+            card_grid(ui, &recent, w, actions);
+            ui.add_space(14.0);
+        }
+
+        if !self.shells.is_empty() {
+            section_label(ui, None, "Local terminals");
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                for (name, path) in &self.shells {
+                    if widgets::chip(ui, icon::TERMINAL, name).clicked() {
+                        actions.push(Action::OpenLocal(path.clone()));
+                    }
+                }
+            });
+            ui.add_space(14.0);
+        }
+
+        if !hosts.is_empty() {
+            ui.horizontal(|ui| {
+                section_label(ui, None, "Hosts by folder");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.link(RichText::new("Add host").size(11.5).color(theme::MUTED)).clicked() {
+                        actions.push(Action::NewHost(None));
+                    }
+                });
+            });
+            let mut groups: BTreeMap<&str, Vec<&Host>> = BTreeMap::new();
+            for h in hosts {
+                groups.entry(h.folder.as_str()).or_default().push(h);
+            }
+            for (folder, mut items) in groups {
+                items.sort_by_key(|h| h.name.to_lowercase());
+                let open = !self.home_collapsed.contains(folder);
+                let name = if folder.is_empty() { "Ungrouped" } else { folder };
+                if widgets::folder_row(ui, name, folder, items.len(), open, 0.0).clicked() {
+                    actions.push(Action::ToggleHomeFolder(folder.to_string()));
+                }
+                if open {
+                    ui.add_space(4.0);
+                    card_grid(ui, &items, w, actions);
+                }
+                ui.add_space(8.0);
+            }
+        }
+    }
+
+    fn settings(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        page_frame(ui, |ui, _w| {
+            ui.label(RichText::new("Settings").size(17.0).strong().color(theme::TEXT));
+            ui.add_space(12.0);
+
+            card(ui, |ui| {
+                ui.label(RichText::new("Vault").strong().color(theme::TEXT));
+                ui.label(
+                    RichText::new("Hosts are encrypted on this computer with Argon2id and AES-256-GCM. The master password is never stored and cannot be recovered.")
+                        .color(theme::MUTED),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("File").color(theme::FAINT));
+                    ui.monospace(store::vault_path().display().to_string());
+                });
+                ui.add_space(6.0);
+                if ui.button(format!("{}  Lock now", icon::LOCK_SIMPLE)).clicked() {
+                    actions.push(Action::Lock);
+                }
+            });
+            ui.add_space(10.0);
+
+            card(ui, |ui| {
+                ui.label(RichText::new("Security").strong().color(theme::TEXT));
+                let st = &mut self.inventory.settings;
+                let before = (st.auto_lock_minutes, st.allow_osc52);
+                ui.horizontal(|ui| {
+                    ui.label("Lock automatically after");
+                    let label = |m: u32| if m == 0 { "Never".to_string() } else { format!("{m} min idle") };
+                    egui::ComboBox::from_id_salt("autolock").selected_text(label(st.auto_lock_minutes)).show_ui(ui, |ui| {
+                        for m in [1, 5, 15, 30, 60, 0] {
+                            ui.selectable_value(&mut st.auto_lock_minutes, m, label(m));
+                        }
+                    });
+                });
+                ui.checkbox(&mut st.allow_osc52, "Let programs in a terminal set the clipboard (OSC 52)");
+                ui.label(
+                    RichText::new("Leave this off unless you use it: a compromised server could put a command on your clipboard.")
+                        .size(11.0)
+                        .color(theme::FAINT),
+                );
+                if before != (st.auto_lock_minutes, st.allow_osc52) {
+                    self.dirty = true;
+                }
+            });
+            ui.add_space(10.0);
+
+            card(ui, |ui| {
+                ui.label(RichText::new("Change master password").strong().color(theme::TEXT));
+                let pc = &mut self.pw_change;
+                egui::Grid::new("pwchange").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Current");
+                    ui.add(egui::TextEdit::singleline(&mut *pc.current).password(true).desired_width(260.0));
+                    ui.end_row();
+                    ui.label("New");
+                    ui.vertical(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut *pc.new).password(true).desired_width(260.0));
+                        strength_meter(ui, &pc.new, 260.0);
+                    });
+                    ui.end_row();
+                    ui.label("Confirm");
+                    ui.add(egui::TextEdit::singleline(&mut *pc.confirm).password(true).desired_width(260.0));
+                    ui.end_row();
+                });
+                if let Some((msg, err)) = &pc.message {
+                    ui.label(RichText::new(msg).color(if *err { theme::DANGER } else { theme::ACCENT }));
+                }
+                if ui.button("Change password").clicked() {
+                    let ok_current = self.password.as_ref().is_some_and(|p| p.as_str() == pc.current.as_str());
+                    pc.message = Some(if !ok_current {
+                        ("Current password is wrong.".into(), true)
+                    } else if let Err(e) = crate::vault::check_new_password(&pc.new) {
+                        (e, true)
+                    } else if pc.new != pc.confirm {
+                        ("New passwords do not match.".into(), true)
+                    } else {
+                        self.password = Some(Zeroizing::new(pc.new.to_string()));
+                        self.dirty = true;
+                        ("Password changed. The vault will be re-encrypted with it in a moment.".into(), false)
+                    });
+                    pc.current.zeroize();
+                    pc.new.zeroize();
+                    pc.confirm.zeroize();
+                }
+            });
+            ui.add_space(10.0);
+
+            card(ui, |ui| {
+                ui.label(RichText::new("Keyboard shortcuts").strong().color(theme::TEXT));
+                let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+                let (new_tab, close_tab) = if cfg!(target_os = "macos") {
+                    ("⌘T".to_string(), "⌘W".to_string())
+                } else {
+                    ("Ctrl+Shift+T".to_string(), "Ctrl+Shift+W".to_string())
+                };
+                egui::Grid::new("keys").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                    for (k, d) in [
+                        (format!("{cmd}Shift+P"), "Command palette"),
+                        (new_tab, "New local terminal"),
+                        (close_tab, "Close tab"),
+                        (format!("{cmd}L"), "Lock vault"),
+                    ] {
+                        ui.monospace(k);
+                        ui.label(RichText::new(d).color(theme::MUTED));
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new(format!("Shellyard v{VERSION} · no telemetry, no automatic network calls")).size(11.0).color(theme::FAINT));
+            if IS_BETA {
+                ui.label(
+                    RichText::new("This is a beta. Keep a backup of your vault file and report problems on GitHub.")
+                        .size(11.0)
+                        .color(Color32::from_rgb(0xe0, 0xb0, 0x40)),
+                );
+            }
+        });
+    }
+
+    fn planned(&mut self, ui: &mut Ui, title: &str, glyph: &str, items: &[&str]) {
+        page_frame(ui, |ui, _w| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                widgets::icon_tile(ui, r, glyph, theme::ACCENT, theme::accent_soft());
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(title).size(17.0).strong().color(theme::TEXT));
+                    ui.label(RichText::new("Not built yet. Planned in docs/PLAN.md.").size(11.5).color(theme::MUTED));
+                });
+            });
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                for it in items {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icon::CHECK).color(theme::FAINT));
+                        ui.label(RichText::new(*it).color(theme::MUTED));
+                    });
+                }
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Lock screen
+
+    fn lock_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| {
+            let bar = ui.interact(Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width(), 40.0)), egui::Id::new("lock-drag"), Sense::drag());
+            if bar.drag_started() {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+        });
+
+        let mut submit = false;
+        egui::Area::new(egui::Id::new("lock"))
+            .anchor(Align2::CENTER_CENTER, [0.0, -20.0])
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .rounding(12.0)
+                    .inner_margin(28.0)
+                    .show(ui, |ui| {
+                        ui.set_width(340.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                            widgets::icon_tile(ui, r, icon::TERMINAL_WINDOW, theme::ACCENT, theme::accent_soft());
+                            ui.label(RichText::new("Shellyard").size(20.0).strong().color(theme::TEXT));
+                            beta_badge(ui);
+                        });
+                        ui.add_space(14.0);
+                        let busy = self.unlocking.is_some();
+                        let field = |ui: &mut Ui, s: &mut String, hint: &str| {
+                            ui.add(
+                                egui::TextEdit::singleline(s)
+                                    .password(true)
+                                    .hint_text(hint)
+                                    .desired_width(f32::INFINITY)
+                                    .margin(Vec2::new(10.0, 8.0)),
+                            )
+                        };
+                        match self.lock.as_mut().unwrap() {
+                            LockScreen::Unlock { password, error, focused } => {
+                                ui.label(RichText::new("Unlock your vault").color(theme::MUTED));
+                                ui.add_space(8.0);
+                                let r = ui.add_enabled_ui(!busy, |ui| field(ui, password, "Master password")).inner;
+                                if !*focused {
+                                    r.request_focus();
+                                    *focused = true;
+                                }
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    submit = true;
+                                }
+                                if let Some(e) = error {
+                                    ui.label(RichText::new(e.as_str()).color(theme::DANGER));
+                                }
+                                ui.add_space(8.0);
+                                ui.vertical_centered_justified(|ui| {
+                                    if busy {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(RichText::new("Unlocking…").color(theme::MUTED));
+                                        });
+                                    } else if widgets::primary_button(ui, "Unlock").clicked() {
+                                        submit = true;
+                                    }
+                                });
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("The master password is never stored. If you lose it, the vault cannot be recovered.")
+                                        .size(11.0)
+                                        .color(theme::FAINT),
+                                );
+                            }
+                            LockScreen::Create { password, confirm, sample, error, focused } => {
+                                ui.label(RichText::new("Create your vault").strong().color(theme::TEXT));
+                                ui.label(
+                                    RichText::new("Your hosts are encrypted on this computer with a master password. It is never stored and cannot be recovered.")
+                                        .color(theme::MUTED),
+                                );
+                                ui.add_space(8.0);
+                                let r = field(ui, password, &format!("Master password ({}+ characters)", crate::vault::MIN_PASSWORD_CHARS));
+                                if !*focused {
+                                    r.request_focus();
+                                    *focused = true;
+                                }
+                                strength_meter(ui, password, ui.available_width());
+                                let r2 = field(ui, confirm, "Confirm master password");
+                                if r2.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    submit = true;
+                                }
+                                ui.checkbox(sample, "Add example hosts");
+                                if let Some(e) = error {
+                                    ui.label(RichText::new(e.as_str()).color(theme::DANGER));
+                                }
+                                ui.add_space(8.0);
+                                ui.vertical_centered_justified(|ui| {
+                                    if widgets::primary_button(ui, "Create vault").clicked() {
+                                        submit = true;
+                                    }
+                                });
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(store::vault_path().display().to_string()).size(10.0).color(theme::FAINT));
+                    });
+            });
+
+        if submit {
+            self.submit_lock(ctx);
+        }
+    }
+
+    fn submit_lock(&mut self, ctx: &egui::Context) {
+        match self.lock.as_mut().unwrap() {
+            LockScreen::Unlock { password, error, .. } => {
+                if self.unlocking.is_some() || password.is_empty() {
+                    return;
+                }
+                *error = None;
+                let password = std::mem::take(password);
+                let pw = password.clone();
+                let repaint = ctx.clone();
+                let job = std::thread::spawn(move || {
+                    let r = store::load(&pw);
+                    repaint.request_repaint();
+                    r
+                });
+                self.unlocking = Some(Unlocking { password, job });
+            }
+            LockScreen::Create { password, confirm, sample, error, .. } => {
+                if let Err(e) = crate::vault::check_new_password(password) {
+                    *error = Some(e);
+                    return;
+                }
+                if password != confirm {
+                    *error = Some("Passwords do not match.".into());
+                    return;
+                }
+                let inv = if *sample { Inventory::sample() } else { Inventory::default() };
+                match store::save(password, &inv) {
+                    Ok(()) => {
+                        confirm.zeroize();
+                        self.password = Some(std::mem::take(password));
+                        self.inventory = inv;
+                        self.lock = None;
+                        self.toast(ctx, "Vault created.", false);
+                    }
+                    Err(e) => *error = Some(format!("Could not create vault: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Finishes a background unlock once its thread is done.
+    fn poll_unlock(&mut self, ctx: &egui::Context) {
+        if !self.unlocking.as_ref().is_some_and(|u| u.job.is_finished()) {
+            return;
+        }
+        let Unlocking { password, job } = self.unlocking.take().unwrap();
+        let result = job.join().unwrap_or_else(|_| Err(anyhow::anyhow!("unlock failed unexpectedly")));
+        match result {
+            Ok(inv) => {
+                self.password = Some(password);
+                self.inventory = inv;
+                self.lock = None;
+                self.last_input = ctx.input(|i| i.time);
+                self.focus_active = self.active.is_some();
+                let auto: Vec<String> = self
+                    .inventory
+                    .tunnels
+                    .iter()
+                    .filter(|t| t.auto_start && !self.tunnels_running.contains_key(&t.id))
+                    .map(|t| t.id.clone())
+                    .collect();
+                for id in auto {
+                    self.start_tunnel(ctx, &id);
+                }
+            }
+            Err(e) => {
+                if let Some(LockScreen::Unlock { error, focused, .. }) = &mut self.lock {
+                    *error = Some(e.to_string());
+                    *focused = false;
+                }
+            }
+        }
+    }
+
+    /// Locks after the configured idle time without keyboard or mouse input.
+    fn auto_lock(&mut self, ctx: &egui::Context) {
+        let (now, active) = ctx.input(|i| {
+            let active = i.pointer.is_moving()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                });
+            (i.time, active)
+        });
+        if active {
+            self.last_input = now;
+        }
+        let minutes = self.inventory.settings.auto_lock_minutes;
+        if minutes == 0 {
+            return;
+        }
+        let limit = f64::from(minutes) * 60.0;
+        let idle = now - self.last_input;
+        if idle >= limit {
+            self.lock_now(ctx);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(limit - idle + 0.5));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Host editor
+
+    fn host_form_ui(&mut self, ctx: &egui::Context) {
+        let keys = &self.inventory.keys;
+        let mut manage_keys = false;
+        let Some(form) = self.host_form.as_mut() else { return };
+        let mut close = false;
+        let mut save = false;
+        let mut delete = false;
+        let title = if form.is_new { "New host" } else { "Edit host" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                let h = &mut form.host;
+                egui::Grid::new("hostform").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(egui::TextEdit::singleline(&mut h.name).hint_text("web-01").desired_width(260.0));
+                    ui.end_row();
+                    ui.label("Address");
+                    ui.add(egui::TextEdit::singleline(&mut h.address).hint_text("host.example.com or IP").desired_width(260.0));
+                    ui.end_row();
+                    ui.label("Port");
+                    ui.add(egui::TextEdit::singleline(&mut form.port).desired_width(80.0));
+                    ui.end_row();
+                    ui.label("User");
+                    ui.add(egui::TextEdit::singleline(&mut h.user).hint_text("ops").desired_width(260.0));
+                    ui.end_row();
+                    ui.label("Folder");
+                    ui.add(egui::TextEdit::singleline(&mut h.folder).hint_text("Production/Web").desired_width(260.0));
+                    ui.end_row();
+                    ui.label("Type");
+                    egui::ComboBox::from_id_salt("kind").selected_text(h.kind.label()).show_ui(ui, |ui| {
+                        for k in HostKind::ALL {
+                            ui.selectable_value(&mut h.kind, k, k.label());
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Protocols");
+                    ui.horizontal(|ui| {
+                        for p in [Protocol::Ssh, Protocol::Sftp, Protocol::Rdp] {
+                            let mut on = h.has(p);
+                            if ui.checkbox(&mut on, p.label()).changed() {
+                                if on {
+                                    h.protocols.push(p);
+                                } else {
+                                    h.protocols.retain(|x| *x != p);
+                                }
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("SSH key");
+                    ui.horizontal(|ui| {
+                        let current = h
+                            .key_id
+                            .as_ref()
+                            .and_then(|id| keys.iter().find(|k| &k.id == id))
+                            .map(|k| k.name.clone())
+                            .unwrap_or_else(|| "SSH agent / default keys".into());
+                        egui::ComboBox::from_id_salt("hostkey").width(200.0).selected_text(current).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut h.key_id, None, "SSH agent / default keys");
+                            for k in keys {
+                                ui.selectable_value(&mut h.key_id, Some(k.id.clone()), k.name.as_str());
+                            }
+                        });
+                        if ui.link("Manage").clicked() {
+                            manage_keys = true;
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Tags");
+                    ui.add(egui::TextEdit::singleline(&mut form.tags).hint_text("comma, separated").desired_width(260.0));
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut h.favorite, "Favorite");
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("With no key picked, OpenSSH uses your agent and ~/.ssh keys. Passwords and passphrases are typed in the terminal.")
+                        .size(11.0)
+                        .color(theme::FAINT),
+                );
+                if let Some(e) = &form.error {
+                    ui.label(RichText::new(e.as_str()).color(theme::DANGER));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if form.confirm_delete {
+                        ui.label(RichText::new(format!("Delete {}?", form.host.name)).color(theme::DANGER));
+                        if ui.button(RichText::new("Delete").color(theme::DANGER)).clicked() {
+                            delete = true;
+                        }
+                        if ui.button("Keep").clicked() {
+                            form.confirm_delete = false;
+                        }
+                        return;
+                    }
+                    if widgets::primary_button(ui, "  Save  ").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        close = true;
+                    }
+                    if !form.is_new {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(RichText::new(format!("{}  Delete", icon::TRASH)).color(theme::DANGER)).clicked() {
+                                form.confirm_delete = true;
+                            }
+                        });
+                    }
+                });
+            });
+
+        if manage_keys {
+            self.page = Page::Keys;
+            self.active = None;
+        }
+        if delete {
+            let id = form.host.id.clone();
+            self.inventory.hosts.retain(|h| h.id != id);
+            self.dirty = true;
+            self.host_form = None;
+            return;
+        }
+        if save {
+            match form.validate() {
+                Ok(host) => {
+                    if let Some(existing) = self.inventory.hosts.iter_mut().find(|h| h.id == host.id) {
+                        *existing = host;
+                    } else {
+                        self.inventory.hosts.push(host);
+                    }
+                    self.dirty = true;
+                    self.host_form = None;
+                }
+                Err(e) => form.error = Some(e),
+            }
+            return;
+        }
+        if close {
+            self.host_form = None;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Command palette
+
+    fn palette_items(&self) -> Vec<(String, String, Action)> {
+        let mut items: Vec<(String, String, Action)> = Vec::new();
+        let mut hosts: Vec<&Host> = self.inventory.hosts.iter().collect();
+        hosts.sort_by_key(|h| (std::cmp::Reverse(h.last_connected), h.name.to_lowercase()));
+        for h in hosts {
+            items.push((format!("{}  Connect to {}", widgets::kind_icon(h.kind), h.name), h.target(), Action::Connect(h.id.clone(), default_protocol(h))));
+            if h.has(Protocol::Sftp) && h.has(Protocol::Ssh) {
+                items.push((format!("{}  SFTP to {}", icon::FOLDER_SIMPLE, h.name), h.target(), Action::Connect(h.id.clone(), Protocol::Sftp)));
+            }
+        }
+        for (name, path) in &self.shells {
+            items.push((format!("{}  New {name} terminal", icon::TERMINAL), path.clone(), Action::OpenLocal(path.clone())));
+        }
+        for (i, s) in self.sessions.iter().enumerate() {
+            items.push((format!("{}  Switch to tab {}", s.glyph, s.label), String::new(), Action::SelectTab(Some(i))));
+        }
+        if let Some(i) = self.active {
+            items.push((format!("{}  Close current tab", icon::X), String::new(), Action::CloseTab(i)));
+        }
+        for t in &self.inventory.tunnels {
+            let running = self.tunnels_running.get(&t.id).is_some_and(|r| !r.exited);
+            if running {
+                items.push((format!("{}  Stop tunnel {}", icon::ARROWS_LEFT_RIGHT, t.name), t.describe(), Action::StopTunnel(t.id.clone())));
+            } else {
+                items.push((format!("{}  Start tunnel {}", icon::ARROWS_LEFT_RIGHT, t.name), t.describe(), Action::StartTunnel(t.id.clone())));
+            }
+        }
+        items.push((format!("{}  Add host", icon::PLUS), String::new(), Action::NewHost(None)));
+        items.push((format!("{}  New note", icon::NOTE), String::new(), Action::NewNote(None)));
+        items.push((format!("{}  New tunnel", icon::ARROWS_LEFT_RIGHT), String::new(), Action::NewTunnel(None)));
+        items.push((format!("{}  Tunnels", icon::ARROWS_LEFT_RIGHT), String::new(), Action::Page(Page::Tunnels)));
+        items.push((format!("{}  SSH keys", icon::KEY), String::new(), Action::Page(Page::Keys)));
+        items.push((format!("{}  Notes", icon::NOTE), String::new(), Action::Page(Page::Notes)));
+        items.push((format!("{}  Go home", icon::HOUSE), String::new(), Action::SelectTab(None)));
+        items.push((format!("{}  Toggle hosts sidebar", icon::SIDEBAR_SIMPLE), String::new(), Action::ToggleSidebar));
+        items.push((format!("{}  Settings", icon::GEAR), String::new(), Action::Page(Page::Settings)));
+        items.push((format!("{}  Lock vault", icon::LOCK_SIMPLE), String::new(), Action::Lock));
+        items
+    }
+
+    fn palette_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if self.palette.is_none() {
+            return;
+        }
+        let all = self.palette_items();
+        let p = self.palette.as_mut().unwrap();
+        let words: Vec<String> = p.query.to_lowercase().split_whitespace().map(String::from).collect();
+        let matches: Vec<&(String, String, Action)> = all
+            .iter()
+            .filter(|(label, hint, _)| {
+                let hay = format!("{label} {hint}").to_lowercase();
+                words.iter().all(|w| hay.contains(w))
+            })
+            .take(12)
+            .collect();
+        if p.selected >= matches.len() {
+            p.selected = matches.len().saturating_sub(1);
+        }
+        let (up, down, enter, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if up {
+            p.selected = p.selected.saturating_sub(1);
+        }
+        if down && p.selected + 1 < matches.len() {
+            p.selected += 1;
+        }
+
+        let mut run: Option<Action> = None;
+        let mut close = esc;
+        let resp = egui::Window::new("palette")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, [0.0, 70.0])
+            .fixed_size([540.0, 0.0])
+            .show(ctx, |ui| {
+                let id = egui::Id::new("palette-input");
+                let r = widgets::search_box(ui, &mut p.query, "Type a command or host…", 36.0, false, id);
+                if p.opened {
+                    r.request_focus();
+                    p.opened = false;
+                }
+                if r.changed() {
+                    p.selected = 0;
+                }
+                ui.add_space(6.0);
+                if matches.is_empty() {
+                    ui.label(RichText::new("No matches").color(theme::FAINT));
+                }
+                for (i, (label, hint, action)) in matches.iter().enumerate() {
+                    let (rect, row) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+                    if row.hovered() || i == p.selected {
+                        ui.painter().rect_filled(rect, 6.0, if i == p.selected { theme::accent_soft() } else { theme::SURFACE_HOVER });
+                    }
+                    let color = if i == p.selected { theme::ACCENT } else { theme::TEXT };
+                    ui.painter().text(rect.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), color);
+                    ui.painter().text(rect.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, hint, FontId::proportional(11.0), theme::FAINT);
+                    if row.clicked() {
+                        run = Some(action.clone());
+                    }
+                }
+                if enter {
+                    if let Some((_, _, a)) = matches.get(p.selected) {
+                        run = Some(a.clone());
+                    }
+                }
+            });
+        if let Some(r) = resp {
+            if r.response.clicked_elsewhere() {
+                close = true;
+            }
+        }
+        if let Some(a) = run {
+            actions.push(a);
+            close = true;
+        }
+        if close {
+            self.palette = None;
+        }
+    }
+
+    fn toast_ui(&mut self, ctx: &egui::Context) {
+        let Some((msg, error, t0)) = &self.toast else { return };
+        let now = ctx.input(|i| i.time);
+        if now - t0 > 5.0 {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        egui::Area::new(egui::Id::new("toast")).anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0]).show(ctx, |ui| {
+            Frame::none()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0_f32, if *error { theme::DANGER } else { theme::BORDER }))
+                .rounding(8.0)
+                .inner_margin(Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(RichText::new(msg.as_str()).color(theme::TEXT));
+                });
+        });
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mac = cfg!(target_os = "macos");
+        let tab_mods = if mac { Modifiers::MAC_CMD } else { Modifiers::CTRL | Modifiers::SHIFT };
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::P) {
+                actions.push(Action::OpenPalette);
+            }
+            if i.consume_key(tab_mods, Key::T) {
+                actions.push(Action::OpenLocal(terminal::default_shell()));
+            }
+            if i.consume_key(tab_mods, Key::W) {
+                if let Some(a) = self.active {
+                    actions.push(Action::CloseTab(a));
+                }
+            }
+            if mac && i.consume_key(Modifiers::MAC_CMD, Key::L) {
+                actions.push(Action::Lock);
+            }
+            if mac {
+                for (n, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if i.consume_key(Modifiers::MAC_CMD, key) {
+                        actions.push(Action::SelectTab(if n == 0 { None } else { Some(n - 1) }));
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.flush_save();
+        }
+        self.poll_save(ctx);
+        self.poll_unlock(ctx);
+
+        // Keep every session and tunnel reading output, also in hidden tabs
+        // and while locked. The active tab is drawn (and pumped) below.
+        let allow_clipboard = self.inventory.settings.allow_osc52 && self.lock.is_none();
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            s.term.allow_clipboard = allow_clipboard;
+            if self.lock.is_some() || Some(i) != self.active {
+                s.term.poll(ctx);
+            }
+        }
+        for t in self.tunnels_running.values_mut() {
+            t.allow_clipboard = false;
+            t.poll(ctx);
+        }
+
+        if self.lock.is_some() {
+            self.lock_screen(ctx);
+            self.toast_ui(ctx);
+            return;
+        }
+        self.auto_lock(ctx);
+        if self.lock.is_some() {
+            return;
+        }
+
+        let mut actions: Vec<Action> = Vec::new();
+        let modal = self.host_form.is_some() || self.key_form.is_some() || self.new_key_form.is_some() || self.tunnel_form.is_some();
+        if self.palette.is_none() && !modal {
+            self.shortcuts(ctx, &mut actions);
+        }
+
+        let left_inset = if cfg!(target_os = "macos") { 80.0 } else { 10.0 };
+        egui::TopBottomPanel::top("topbar")
+            .exact_height(42.0)
+            .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: left_inset, right: 10.0, top: 6.0, bottom: 6.0 }))
+            .show(ctx, |ui| self.top_bar(ui, &mut actions));
+
+        egui::SidePanel::left("rail")
+            .exact_width(66.0)
+            .resizable(false)
+            .frame(Frame::none().fill(theme::BG).inner_margin(Margin::symmetric(6.0, 10.0)).stroke(Stroke::new(1.0_f32, theme::BORDER)))
+            .show(ctx, |ui| self.rail(ui, &mut actions));
+
+        egui::SidePanel::left("hosts")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(220.0..=460.0)
+            .frame(Frame::none().fill(theme::PANEL).inner_margin(Margin::same(10.0)).stroke(Stroke::new(1.0_f32, theme::BORDER)))
+            .show_animated(ctx, self.sidebar_open, |ui| self.sidebar(ui, &mut actions));
+
+        egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| {
+            if let Some(i) = self.active {
+                let s = &mut self.sessions[i];
+                if self.focus_active && self.palette.is_none() && !modal {
+                    s.term.focus(ui.ctx());
+                    self.focus_active = false;
+                }
+                s.term.show(ui);
+            } else {
+                match self.page {
+                    Page::Home => self.home(ui, &mut actions),
+                    Page::Settings => self.settings(ui, &mut actions),
+                    Page::Tunnels => self.tunnels_page(ui, &mut actions),
+                    Page::Keys => self.keys_page(ui),
+                    Page::Notes => self.notes_page(ui, &mut actions),
+                    Page::Docker => self.planned(
+                        ui,
+                        "Docker",
+                        icon::CUBE,
+                        &[
+                            "List containers on the local engine or over an SSH connection, grouped by Compose project",
+                            "Exec a shell, stream logs, inspect config and networks",
+                            "Start, stop, restart, pause, kill and remove",
+                        ],
+                    ),
+                }
+            }
+        });
+
+        self.host_form_ui(ctx);
+        self.key_form_ui(ctx);
+        self.new_key_form_ui(ctx, &mut actions);
+        self.tunnel_form_ui(ctx);
+        self.palette_ui(ctx, &mut actions);
+        self.toast_ui(ctx);
+
+        if !actions.is_empty() {
+            self.apply(ctx, actions);
+            ctx.request_repaint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+
+/// A thin bar showing how hard a new master password is to guess.
+fn strength_meter(ui: &mut Ui, pw: &str, width: f32) {
+    if pw.is_empty() {
+        return;
+    }
+    let bits = crate::vault::password_bits(pw);
+    let ok = crate::vault::check_new_password(pw).is_ok();
+    let (label, color) = if !ok {
+        ("Too weak", theme::DANGER)
+    } else if bits < 80.0 {
+        ("Good", Color32::from_rgb(0xe0, 0xb0, 0x40))
+    } else {
+        ("Strong", theme::ACCENT)
+    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 4.0), Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, theme::SURFACE);
+    let frac = (bits / 100.0).clamp(0.05, 1.0) as f32;
+    ui.painter().rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width() * frac, 4.0)), 2.0, color);
+    ui.label(RichText::new(label).size(10.5).color(color));
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn default_protocol(h: &Host) -> Protocol {
+    if h.has(Protocol::Ssh) {
+        Protocol::Ssh
+    } else if h.has(Protocol::Sftp) {
+        Protocol::Sftp
+    } else if h.has(Protocol::Rdp) {
+        Protocol::Rdp
+    } else {
+        Protocol::Ssh
+    }
+}
+
+impl HostForm {
+    fn new(host: Host, is_new: bool) -> Self {
+        Self {
+            port: host.port.to_string(),
+            tags: host.tags.join(", "),
+            host,
+            is_new,
+            error: None,
+            confirm_delete: false,
+        }
+    }
+
+    fn validate(&self) -> Result<Host, String> {
+        let mut h = self.host.clone();
+        h.name = h.name.trim().to_string();
+        h.address = h.address.trim().to_string();
+        h.user = h.user.trim().to_string();
+        h.folder = h.folder.split('/').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/");
+        if h.name.is_empty() {
+            return Err("Name is required.".into());
+        }
+        if h.address.is_empty() || h.address.starts_with('-') || h.address.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("Address must be a host name or IP with no spaces, not starting with '-'.".into());
+        }
+        if h.user.starts_with('-') || h.user.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("User must not contain spaces or start with '-'.".into());
+        }
+        h.port = match self.port.trim().parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return Err("Port must be a number from 1 to 65535.".into()),
+        };
+        if h.protocols.is_empty() {
+            return Err("Pick at least one protocol.".into());
+        }
+        h.tags = self.tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        Ok(h)
+    }
+}
+
+#[derive(Default)]
+struct Node {
+    children: BTreeMap<String, Node>,
+    hosts: Vec<usize>,
+    count: usize,
+}
+
+impl Node {
+    fn build(hosts: &[Host], visible: &dyn Fn(&Host) -> bool) -> Node {
+        let mut root = Node::default();
+        for (i, h) in hosts.iter().enumerate() {
+            if !visible(h) {
+                continue;
+            }
+            let mut node = &mut root;
+            node.count += 1;
+            for seg in h.folder.split('/').filter(|s| !s.is_empty()) {
+                node = node.children.entry(seg.to_string()).or_default();
+                node.count += 1;
+            }
+            node.hosts.push(i);
+        }
+        let sort = |n: &mut Node| n.hosts.sort_by_key(|i| hosts[*i].name.to_lowercase());
+        fn walk(n: &mut Node, f: &dyn Fn(&mut Node)) {
+            f(n);
+            for c in n.children.values_mut() {
+                walk(c, f);
+            }
+        }
+        walk(&mut root, &sort);
+        root
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_ui(
+    ui: &mut Ui,
+    node: &Node,
+    prefix: &str,
+    depth: usize,
+    hosts: &[Host],
+    collapsed: &HashSet<String>,
+    searching: bool,
+    actions: &mut Vec<Action>,
+) {
+    let indent = depth as f32 * 14.0;
+    for (name, child) in &node.children {
+        let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        let open = searching || !collapsed.contains(&path);
+        let r = widgets::folder_row(ui, name, &path, child.count, open, indent);
+        if r.clicked() {
+            actions.push(Action::ToggleFolder(path.clone()));
+        }
+        r.context_menu(|ui| {
+            if ui.button(format!("{}  New host here", icon::PLUS)).clicked() {
+                actions.push(Action::NewHost(Some(path.clone())));
+                ui.close_menu();
+            }
+        });
+        if open {
+            tree_ui(ui, child, &path, depth + 1, hosts, collapsed, searching, actions);
+        }
+    }
+    for &i in &node.hosts {
+        let h = &hosts[i];
+        let r = widgets::host_row(ui, h, indent + if depth > 0 { 2.0 } else { 0.0 });
+        host_interact(r, h, actions);
+    }
+}
+
+fn host_interact(r: egui::Response, h: &Host, actions: &mut Vec<Action>) {
+    let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if r.clicked() {
+        actions.push(Action::Connect(h.id.clone(), default_protocol(h)));
+    }
+    r.context_menu(|ui| {
+        ui.set_min_width(180.0);
+        for p in [Protocol::Ssh, Protocol::Sftp, Protocol::Rdp] {
+            if h.has(p) && ui.button(format!("{}  Open {}", icon::PLAY, p.label())).clicked() {
+                actions.push(Action::Connect(h.id.clone(), p));
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+        if ui.button(format!("{}  Edit…", icon::PENCIL_SIMPLE)).clicked() {
+            actions.push(Action::EditHost(h.id.clone()));
+            ui.close_menu();
+        }
+        let fav = if h.favorite { "Remove from favorites" } else { "Add to favorites" };
+        if ui.button(format!("{}  {fav}", icon::STAR)).clicked() {
+            actions.push(Action::ToggleFavorite(h.id.clone()));
+            ui.close_menu();
+        }
+        if ui.button(format!("{}  New tunnel…", icon::ARROWS_LEFT_RIGHT)).clicked() {
+            actions.push(Action::NewTunnel(Some(h.id.clone())));
+            ui.close_menu();
+        }
+        if ui.button(format!("{}  New note", icon::NOTE)).clicked() {
+            actions.push(Action::NewNote(Some(h.id.clone())));
+            ui.close_menu();
+        }
+        if h.key_id.is_some() && ui.button(format!("{}  Install SSH key on host", icon::KEY)).clicked() {
+            actions.push(Action::InstallKey(h.id.clone()));
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button(format!("{}  Duplicate", icon::STACK)).clicked() {
+            actions.push(Action::Duplicate(h.id.clone()));
+            ui.close_menu();
+        }
+        if ui.button(RichText::new(format!("{}  Delete…", icon::TRASH)).color(theme::DANGER)).clicked() {
+            actions.push(Action::DeleteHost(h.id.clone()));
+            ui.close_menu();
+        }
+    });
+}
+
+fn card_grid(ui: &mut Ui, hosts: &[&Host], w: f32, actions: &mut Vec<Action>) {
+    let gap = 10.0;
+    let cols = if w < 460.0 { 1 } else { 2 };
+    let cw = (w - gap * (cols as f32 - 1.0)) / cols as f32;
+    for row in hosts.chunks(cols) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for h in row {
+                let r = host_card(ui, h, cw);
+                host_interact(r, h, actions);
+            }
+        });
+        ui.add_space(4.0);
+    }
+}
+
+fn page_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui, f32)) {
+    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let full = ui.available_width();
+        let w = (full - 48.0).clamp(280.0, 700.0);
+        let left = ((full - w) / 2.0).max(0.0);
+        ui.add_space(36.0);
+        ui.horizontal(|ui| {
+            ui.add_space(left);
+            ui.vertical(|ui| {
+                ui.set_width(w);
+                add(ui, w);
+            });
+        });
+        ui.add_space(40.0);
+    });
+}
+
+fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    Frame::none()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
+        .rounding(8.0)
+        .inner_margin(16.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        });
+}
+
+fn tab_pill(ui: &mut Ui, glyph: &str, label: &str, active: bool, closable: bool, tooltip: &str) -> (egui::Response, Option<egui::Response>) {
+    let font = FontId::proportional(13.0);
+    let shown: String = if label.chars().count() > 22 { format!("{}…", label.chars().take(21).collect::<String>()) } else { label.to_string() };
+    let g = ui.fonts(|f| f.layout_no_wrap(shown, font.clone(), theme::TEXT));
+    let close_w = if closable { 20.0 } else { 0.0 };
+    let size = Vec2::new(g.size().x + 40.0 + close_w, 28.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (fill, fg) = if active {
+        (theme::accent_soft(), theme::ACCENT)
+    } else if resp.hovered() {
+        (theme::SURFACE_HOVER, theme::TEXT)
+    } else {
+        (Color32::TRANSPARENT, theme::MUTED)
+    };
+    ui.painter().rect_filled(rect, 7.0, fill);
+    ui.painter().text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, glyph, FontId::proportional(14.0), fg);
+    ui.painter().galley(Pos2::new(rect.left() + 32.0, rect.center().y - g.size().y / 2.0), g, fg);
+
+    let close = if closable {
+        let cr = Rect::from_center_size(Pos2::new(rect.right() - 14.0, rect.center().y), Vec2::splat(18.0));
+        let c = ui.interact(cr, resp.id.with("close"), Sense::click());
+        if c.hovered() {
+            ui.painter().rect_filled(cr, 4.0, Color32::from_white_alpha(18));
+        }
+        let color = if c.hovered() { theme::TEXT } else { theme::FAINT };
+        ui.painter().text(cr.center(), Align2::CENTER_CENTER, icon::X, FontId::proportional(11.0), color);
+        Some(c)
+    } else {
+        None
+    };
+    let resp = if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) };
+    (resp, close)
+}
+
+fn rail_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(52.0, 48.0), Sense::click());
+    let (fill, fg) = if active {
+        (theme::accent_soft(), theme::ACCENT)
+    } else if resp.hovered() {
+        (theme::SURFACE_HOVER, theme::TEXT)
+    } else {
+        (Color32::TRANSPARENT, theme::MUTED)
+    };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    if active {
+        let bar = Rect::from_min_size(Pos2::new(rect.left() - 6.0, rect.top() + 10.0), Vec2::new(3.0, rect.height() - 20.0));
+        ui.painter().rect_filled(bar, Rounding::same(2.0), theme::ACCENT);
+    }
+    ui.painter().text(rect.center() - Vec2::new(0.0, 7.0), Align2::CENTER_CENTER, glyph, FontId::proportional(19.0), fg);
+    ui.painter().text(rect.center() + Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, label, FontId::proportional(10.0), fg);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn segment(ui: &mut Ui, label: &str, active: bool, w: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
+    let (fill, fg) = if active {
+        (theme::accent_soft(), theme::ACCENT)
+    } else if resp.hovered() {
+        (theme::SURFACE_HOVER, theme::TEXT)
+    } else {
+        (Color32::TRANSPARENT, theme::MUTED)
+    };
+    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), fg);
+    resp
+}
+
+fn search_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
+    let stroke = if resp.hovered() { Color32::from_rgb(0x34, 0x3d, 0x4a) } else { theme::BORDER };
+    ui.painter().rect_filled(rect, 7.0, theme::PANEL);
+    ui.painter().rect_stroke(rect, 7.0, Stroke::new(1.0_f32, stroke));
+    ui.painter().text(rect.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, icon::MAGNIFYING_GLASS, FontId::proportional(13.0), theme::MUTED);
+    ui.painter().text(rect.left_center() + Vec2::new(30.0, 0.0), Align2::LEFT_CENTER, "Search…", FontId::proportional(12.5), theme::MUTED);
+    let keys = if cfg!(target_os = "macos") { "⌘ ⇧ P" } else { "Ctrl+Shift+P" };
+    let g = ui.fonts(|f| f.layout_no_wrap(keys.to_string(), FontId::proportional(10.5), theme::FAINT));
+    let kr = Rect::from_min_size(Pos2::new(rect.right() - g.size().x - 16.0, rect.center().y - 9.0), Vec2::new(g.size().x + 10.0, 18.0));
+    ui.painter().rect_filled(kr, 4.0, theme::SURFACE);
+    ui.painter().rect_stroke(kr, 4.0, Stroke::new(1.0_f32, theme::BORDER));
+    ui.painter().galley(kr.min + Vec2::new(5.0, 9.0 - g.size().y / 2.0), g, theme::FAINT);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// True for pre-release builds (`x.y.z-beta.n`); shown in the UI so nobody
+/// mistakes a beta for a stable release.
+const IS_BETA: bool = !env!("CARGO_PKG_VERSION_PRE").is_empty();
+
+fn beta_badge(ui: &mut Ui) {
+    if !IS_BETA {
+        return;
+    }
+    let g = ui.fonts(|f| f.layout_no_wrap("BETA".to_owned(), FontId::proportional(10.0), Color32::from_rgb(0xe0, 0xb0, 0x40)));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(g.size().x + 12.0, 18.0), Sense::hover());
+    ui.painter().rect_stroke(rect, 9.0, Stroke::new(1.0_f32, Color32::from_rgb(0xe0, 0xb0, 0x40)));
+    ui.painter().galley(Pos2::new(rect.left() + 6.0, rect.center().y - g.size().y / 2.0), g, Color32::from_rgb(0xe0, 0xb0, 0x40));
+}
+
+fn version_pill(ui: &mut Ui) {
+    let text = format!("v{VERSION}");
+    let g = ui.fonts(|f| f.layout_no_wrap(text, FontId::proportional(11.5), theme::ON_ACCENT));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 22.0), Sense::hover());
+    ui.painter().rect_filled(rect, 11.0, theme::ACCENT);
+    ui.painter().galley(Pos2::new(rect.left() + 10.0, rect.center().y - g.size().y / 2.0), g, theme::ON_ACCENT);
+}

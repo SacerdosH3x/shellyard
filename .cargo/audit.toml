@@ -1,0 +1,11 @@
+# cargo audit configuration. Every ignored advisory needs a reason here and in docs/SECURITY.md.
+[advisories]
+ignore = [
+    # quick-xml 0.30 (denial of service on hostile XML). Linux only:
+    # eframe -> accesskit_unix -> atspi-common -> zbus-lockstep -> zbus_xml.
+    # zbus-lockstep runs inside atspi's proc macros and tests at compile time and
+    # parses the D-Bus XML files shipped in the atspi crate; Shellyard never
+    # parses XML at run time. Remove when egui/accesskit move to quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Shellyard
+Comment=SSH, SFTP, tunnels and terminals with an encrypted vault
+Exec=shellyard
+Icon=shellyard
+Terminal=false
+Categories=Development;Network;System;TerminalEmulator;
+Keywords=ssh;sftp;terminal;tunnel;

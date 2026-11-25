@@ -1,0 +1,278 @@
+//! Reads and writes the sealed inventory file on this machine.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use zeroize::Zeroizing;
+
+use crate::{model::Inventory, vault};
+
+pub fn vault_path() -> PathBuf {
+    if let Ok(p) = std::env::var("SHELLYARD_VAULT") {
+        return PathBuf::from(p);
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Shellyard")
+        .join("shellyard.vault")
+}
+
+/// Moves the data folder from before the rename (Hostdeck → Shellyard) to the
+/// new location, once, if only the old one exists.
+pub fn migrate_legacy() {
+    if std::env::var_os("SHELLYARD_VAULT").is_some() {
+        return;
+    }
+    let Some(data) = dirs::data_dir() else { return };
+    let (old_dir, new_dir) = (data.join("Hostdeck"), data.join("Shellyard"));
+    let old_vault = old_dir.join("hostdeck.vault");
+    if new_dir.exists() || !old_vault.is_file() {
+        return;
+    }
+    if std::fs::rename(&old_dir, &new_dir).is_ok() {
+        let _ = std::fs::rename(new_dir.join("hostdeck.vault"), new_dir.join("shellyard.vault"));
+    }
+}
+
+pub fn exists() -> bool {
+    vault_path().is_file()
+}
+
+pub fn load(password: &str) -> Result<Inventory> {
+    load_from(&vault_path(), password)
+}
+
+fn load_from(path: &std::path::Path, password: &str) -> Result<Inventory> {
+    let blob = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let plain = vault::open(password, &blob)?;
+    let inv: Inventory = serde_json::from_slice(&plain).context("vault contents are not valid")?;
+    check_version(&inv)?;
+    Ok(inv)
+}
+
+/// Refuses vaults written by a newer Shellyard: saving them here would silently
+/// drop the fields this version does not know about.
+fn check_version(inv: &Inventory) -> Result<()> {
+    if inv.version > crate::model::INVENTORY_VERSION {
+        anyhow::bail!("this vault was saved by a newer version of Shellyard; update Shellyard to open it");
+    }
+    Ok(())
+}
+
+/// Seals and writes atomically (temp file, then rename).
+pub fn save(password: &str, inventory: &Inventory) -> Result<()> {
+    save_to(&vault_path(), password, inventory)
+}
+
+fn save_to(path: &std::path::Path, password: &str, inventory: &Inventory) -> Result<()> {
+    let json = Zeroizing::new(serde_json::to_vec(inventory)?);
+    let blob = vault::seal(password, &json)?;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let tmp = path.with_extension("vault.tmp");
+    // A leftover from a crash; never write through whatever is there.
+    let _ = std::fs::remove_file(&tmp);
+    let f = write_private(&tmp, &blob)?;
+    // Make sure the bytes are on disk before the rename makes them the vault,
+    // so a power loss cannot leave a truncated vault behind.
+    f.sync_all().with_context(|| format!("cannot write {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Private directory for short-lived key files.
+fn run_dir() -> PathBuf {
+    vault_path().parent().map(|p| p.join("run")).unwrap_or_else(|| PathBuf::from("run"))
+}
+
+/// Writes a key from the vault to a private file (0600, in a 0700 directory)
+/// so OpenSSH can read it. The caller must remove it with [`remove_temp_files`].
+pub fn write_temp_key(contents: &str, public: Option<&str>) -> Result<Vec<PathBuf>> {
+    let dir = run_dir();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let name = crate::model::Host::new_id();
+    let path = dir.join(format!("key-{name}"));
+    let mut body = Zeroizing::new(contents.trim_end().to_string());
+    body.push('\n');
+    write_private(&path, body.as_bytes())?;
+    let mut files = vec![path.clone()];
+    if let Some(public) = public {
+        let pub_path = dir.join(format!("key-{name}.pub"));
+        write_private(&pub_path, format!("{}\n", public.trim()).as_bytes())?;
+        files.push(pub_path);
+    }
+    Ok(files)
+}
+
+/// Creates a new file readable only by this user (it must not exist yet) and writes `bytes`.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<std::fs::File> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("cannot write {}", path.display()))?;
+    f.write_all(bytes).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(f)
+}
+
+/// Overwrites then deletes temporary key files. Symlinks are removed without
+/// writing through them.
+pub fn remove_temp_files(files: &[PathBuf]) {
+    for f in files {
+        if let Ok(meta) = std::fs::symlink_metadata(f) {
+            if meta.is_file() {
+                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(f) {
+                    use std::io::Write;
+                    let _ = file.write_all(&vec![0u8; meta.len() as usize]);
+                    let _ = file.sync_all();
+                }
+            }
+        }
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// Removes key files left behind by a crash. Only files Shellyard itself
+/// creates (`key-*`) are touched, in case the directory is shared.
+pub fn clean_run_dir() {
+    remove_temp_files(&own_temp_files(&run_dir()));
+}
+
+fn own_temp_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("key-")).map(|e| e.path()).collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_key_is_private_and_removed() {
+        let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
+        std::env::set_var("SHELLYARD_VAULT", dir.join("v.vault"));
+        let files = write_temp_key("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----", Some("ssh-ed25519 AAAA test")).unwrap();
+        assert_eq!(files.len(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(files[0].parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert!(std::fs::read_to_string(&files[0]).unwrap().ends_with('\n'));
+        remove_temp_files(&files);
+        assert!(files.iter().all(|f| !f.exists()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saved_vault_is_private_encrypted_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
+        let path = dir.join("sub").join("t.vault");
+        let mut inv = Inventory::sample();
+        inv.keys.push(crate::model::SshKey {
+            id: "k".into(),
+            name: "k".into(),
+            source: crate::model::KeySource::Embedded("-----BEGIN OPENSSH PRIVATE KEY-----SECRETKEYDATA".into()),
+            public: None,
+        });
+        save_to(&path, "a long test password", &inv).unwrap();
+        save_to(&path, "a long test password", &inv).unwrap(); // replaces cleanly
+        let raw = std::fs::read(&path).unwrap();
+        for needle in ["pg-primary", "198.51.100", "SECRETKEYDATA", "systemctl"] {
+            assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle} found in plaintext");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert!(!path.with_extension("vault.tmp").exists());
+        let back = load_from(&path, "a long test password").unwrap();
+        assert_eq!(back.hosts.len(), inv.hosts.len());
+        assert!(load_from(&path, "wrong password!!").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn newer_vault_version_is_refused() {
+        let mut inv = Inventory::default();
+        assert!(check_version(&inv).is_ok());
+        inv.version = crate::model::INVENTORY_VERSION + 1;
+        assert!(check_version(&inv).is_err());
+    }
+
+    #[test]
+    fn clean_run_dir_only_touches_own_files() {
+        let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::write(dir.join("run").join("notes.txt"), "keep me").unwrap();
+        std::fs::write(dir.join("run").join("key-dead"), "secret").unwrap();
+        remove_temp_files(&own_temp_files(&dir.join("run")));
+        assert!(!dir.join("run").join("key-dead").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("run").join("notes.txt")).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Decrypted-but-malformed contents must give an error, never a panic.
+    #[test]
+    fn fuzz_inventory_json_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let good = serde_json::to_vec(&Inventory::sample()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        for _ in 0..2000 {
+            let mut b = good.clone();
+            for _ in 0..rng.gen_range(1..6) {
+                let at = rng.gen_range(0..b.len());
+                match rng.gen_range(0..3) {
+                    0 => b[at] = rng.gen(),
+                    1 => {
+                        b.remove(at);
+                    }
+                    _ => {
+                        let junk = b"{}[]\",:0-e\x00";
+                        b.insert(at, junk[rng.gen_range(0..junk.len())]);
+                    }
+                }
+            }
+            if let Ok(inv) = serde_json::from_slice::<Inventory>(&b) {
+                let _ = check_version(&inv);
+            }
+        }
+    }
+
+    #[test]
+    fn version_1_inventory_still_loads() {
+        let v1 = r#"{"version":1,"hosts":[{"id":"1","name":"a","address":"h","port":22,"user":"u","protocols":["Ssh"],"folder":"","favorite":false}]}"#;
+        let inv: Inventory = serde_json::from_str(v1).unwrap();
+        assert_eq!(inv.hosts.len(), 1);
+        assert!(inv.keys.is_empty() && inv.notes.is_empty() && inv.tunnels.is_empty());
+        assert!(inv.hosts[0].key_id.is_none());
+    }
+}
