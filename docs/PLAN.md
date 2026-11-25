@@ -33,7 +33,7 @@ See [SECURITY.md](SECURITY.md) for the threat model, the analysis results and kn
 
 1. **Shell (done):** dark UI with icon rail, top bar with tabs, hosts sidebar (protocol filter, search, favorites, folder tree), home page (search, favorites, recent, local terminals, hosts by folder), command palette.
 2. **Vault (mostly done):** create/unlock screen, sealed inventory saved in the background on every change, lock button, change master password. *Still to do:* unlock-policy setting (each launch, once per session, new device only), which needs the OS keychain.
-3. **Local terminal (done):** PTY via portable-pty, VT grid via alacritty_terminal, drawn with the egui painter, keyboard input, resize, scrollback, OSC title.
+3. **Local terminal (done):** PTY via portable-pty, VT grid via alacritty_terminal, drawn with the egui painter, keyboard input, resize, scrollback, OSC title, mouse selection (drag, word, line) and copy, mouse wheel in full-screen programs. *Still to do:* mouse click reporting (tmux/vim mouse mode), search in scrollback, font size setting.
 4. **SSH (interim):** hosts open the system OpenSSH client (`ssh` / `sftp`) inside a terminal tab, so known_hosts, agents and keys already work.
    - **SSH keys (done):** Keys page; per-host key picker. A key is either a file path or stored encrypted in the vault (written to a 0600 temp file only while a session runs, wiped on close, leftovers wiped at startup). Generate with ssh-keygen in a tab; install on a host with ssh-copy-id.
    - *Still to do:* russh for saved passwords and auto-login, reconnect without a new process.

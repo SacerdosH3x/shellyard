@@ -51,7 +51,7 @@ On Debian/Ubuntu run `scripts/linux-deps.sh` first.
 ## Features
 
 - **Hosts:** folders, favorites, tags, search, command palette (⌘⇧P), recent connections.
-- **Terminals:** SSH, SFTP and local shells in tabs, with truecolor, scrollback and bracketed paste.
+- **Terminals:** SSH, SFTP and local shells in tabs, with truecolor, scrollback, mouse selection and copy, and bracketed paste.
 - **SSH keys:** use your `~/.ssh` keys or store keys inside the vault, generate ed25519 keys, install them with `ssh-copy-id`.
 - **Tunnels:** local (`-L`), remote (`-R`) and SOCKS (`-D`) forwards with start/stop, status, a console for prompts, and auto-start.
 - **Notes:** encrypted notes and command snippets, linked to hosts, pasted into a terminal with one click.

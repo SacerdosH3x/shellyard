@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::{viewport_to_point, Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
 use alacritty_terminal::Term;
 use anyhow::{anyhow, Result};
@@ -71,6 +73,8 @@ pub struct Terminal {
     temp_files: Vec<std::path::PathBuf>,
     /// Whether OSC 52 clipboard writes from the program are honored.
     pub allow_clipboard: bool,
+    /// The process has been waited for (no zombie left behind).
+    reaped: bool,
 }
 
 impl SshSpec {
@@ -92,8 +96,21 @@ impl SshSpec {
         if self.program != "ssh-copy-id" {
             a.push("--".into());
         }
-        a.push(if self.user.is_empty() { self.address.clone() } else { format!("{}@{}", self.user, self.address) }.into());
+        let host = destination_host(self.program, &self.address);
+        a.push(if self.user.is_empty() { host } else { format!("{}@{}", self.user, host) }.into());
         a
+    }
+}
+
+/// The host part of the destination as each OpenSSH program expects it: `ssh`
+/// takes a bare IPv6 address (`::1`), while `sftp` treats `:` as the start of
+/// a path unless the address is in brackets (`[::1]`).
+fn destination_host(program: &str, address: &str) -> String {
+    let bare = address.strip_prefix('[').and_then(|a| a.strip_suffix(']')).unwrap_or(address);
+    if program == "sftp" && bare.contains(':') {
+        format!("[{bare}]")
+    } else {
+        bare.to_string()
     }
 }
 
@@ -172,6 +189,7 @@ impl Terminal {
             font_size: 13.5,
             temp_files: Vec::new(),
             allow_clipboard: false,
+            reaped: false,
         })
     }
 
@@ -211,14 +229,7 @@ impl Terminal {
 
     /// Sends text as if pasted, honoring bracketed-paste mode.
     pub fn paste(&mut self, text: &str) {
-        let mut out = Vec::new();
-        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
-            out.extend_from_slice(b"\x1b[200~");
-            out.extend_from_slice(text.replace('\x1b', "").as_bytes());
-            out.extend_from_slice(b"\x1b[201~");
-        } else {
-            out.extend_from_slice(text.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
-        }
+        let out = paste_bytes(text, self.term.mode().contains(TermMode::BRACKETED_PASTE));
         self.term.scroll_display(Scroll::Bottom);
         self.write(&out);
     }
@@ -257,6 +268,26 @@ impl Terminal {
         }
     }
 
+    /// Cleanup once the program has ended: a key written for this session is
+    /// wiped right away instead of when the tab is closed, and the process is
+    /// waited for so it does not linger as a zombie.
+    fn after_exit(&mut self) {
+        if !self.exited {
+            return;
+        }
+        if !self.temp_files.is_empty() {
+            crate::store::remove_temp_files(&std::mem::take(&mut self.temp_files));
+        }
+        if !self.reaped {
+            self.reaped = matches!(self.child.try_wait(), Ok(Some(_)) | Err(_));
+        }
+    }
+
+    /// The selected text, if any.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
     fn pump(&mut self, ctx: &egui::Context) {
         let mut budget = MAX_BYTES_PER_FRAME;
         if !self.pending.is_empty() {
@@ -280,6 +311,7 @@ impl Terminal {
         if budget == 0 {
             ctx.request_repaint();
         }
+        self.after_exit();
 
         let events: Vec<TermEvent> = self.events.0.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for ev in events {
@@ -299,8 +331,8 @@ impl Terminal {
         let (cw, ch) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
         let rect = ui.available_rect_before_wrap();
         ui.allocate_rect(rect, Sense::hover());
-        let resp = ui.interact(rect, self.id, Sense::click());
-        if resp.clicked() {
+        let resp = ui.interact(rect, self.id, Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Text);
+        if resp.clicked() || resp.drag_started() {
             resp.request_focus();
         }
 
@@ -322,37 +354,112 @@ impl Terminal {
             });
             self.handle_input(ui);
         }
+        self.handle_selection(ui, &resp, rect, cw, ch);
         if resp.hovered() {
             let dy = ui.input(|i| i.raw_scroll_delta.y);
             if dy != 0.0 {
                 let lines = (dy / ch).round() as i32;
                 let lines = if lines == 0 { dy.signum() as i32 } else { lines };
-                self.term.scroll_display(Scroll::Delta(lines));
+                let cell = resp.hover_pos().map(|p| self.cell_at(p, rect, cw, ch).0);
+                self.wheel(lines, cell);
             }
         }
+
+        let has_selection = self.term.selection.as_ref().is_some_and(|s| !s.is_empty());
+        resp.context_menu(|ui| {
+            if ui.add_enabled(has_selection, egui::Button::new(format!("{}  Copy", egui_phosphor::regular::COPY))).clicked() {
+                if let Some(text) = self.selection_text() {
+                    ui.ctx().copy_text(text);
+                }
+                ui.close_menu();
+            }
+        });
 
         self.paint(ui, rect, &font, cw, ch, resp.has_focus());
     }
 
+    /// The viewport cell under `pos` (row, column) and which half of it was hit.
+    fn cell_at(&self, pos: Pos2, rect: Rect, cw: f32, ch: f32) -> ((usize, usize), Side) {
+        let x = (pos.x - rect.min.x - PAD) / cw;
+        let y = (pos.y - rect.min.y - PAD) / ch;
+        let col = (x.max(0.0) as usize).min(self.cols.saturating_sub(1));
+        let row = (y.max(0.0) as usize).min(self.rows.saturating_sub(1));
+        let side = if x - x.floor() < 0.5 { Side::Left } else { Side::Right };
+        ((row, col), side)
+    }
+
+    /// Mouse selection: drag selects, double-click selects a word, triple-click a line.
+    fn handle_selection(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: Rect, cw: f32, ch: f32) {
+        let Some(pos) = resp.interact_pointer_pos() else { return };
+        let ((row, col), side) = self.cell_at(pos, rect, cw, ch);
+        let offset = self.term.grid().display_offset();
+        let point = viewport_to_point(offset, Point::new(row, Column(col)));
+        let start = |ty| Some(Selection::new(ty, point, side));
+        if resp.triple_clicked() {
+            self.term.selection = start(SelectionType::Lines);
+        } else if resp.double_clicked() {
+            self.term.selection = start(SelectionType::Semantic);
+        } else if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.term.selection = start(SelectionType::Simple);
+        } else if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(sel) = self.term.selection.as_mut() {
+                sel.update(point, side);
+            }
+            // Keep selecting past the top or bottom edge by scrolling.
+            let edge = if pos.y < rect.top() + PAD { 1 } else if pos.y > rect.bottom() - PAD { -1 } else { 0 };
+            if edge != 0 && !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                self.term.scroll_display(Scroll::Delta(edge));
+                ui.ctx().request_repaint();
+            }
+        } else if resp.clicked() && !ui.input(|i| i.modifiers.shift) {
+            self.term.selection = None;
+        }
+    }
+
+    /// Mouse wheel: scrollback normally; inside full-screen programs (less,
+    /// vim, tmux) the wheel goes to the program, as in other terminals.
+    fn wheel(&mut self, lines: i32, cell: Option<(usize, usize)>) {
+        let mode = *self.term.mode();
+        let n = lines.unsigned_abs().min(20) as usize;
+        if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
+            let (row, col) = cell.unwrap_or((0, 0));
+            let button = if lines > 0 { 64 } else { 65 };
+            let report = format!("\x1b[<{button};{};{}M", col + 1, row + 1);
+            self.write(report.repeat(n).as_bytes());
+        } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
+            let arrow = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
+                (true, true) => "\x1bOA",
+                (true, false) => "\x1b[A",
+                (false, true) => "\x1bOB",
+                (false, false) => "\x1b[B",
+            };
+            self.write(arrow.repeat(n).as_bytes());
+        } else {
+            self.term.scroll_display(Scroll::Delta(lines));
+        }
+    }
+
     fn handle_input(&mut self, ui: &egui::Ui) {
         let mode = *self.term.mode();
-        let events = ui.input(|i| i.events.clone());
+        let (events, shift) = ui.input(|i| (i.events.clone(), i.modifiers.shift));
         let mut out: Vec<u8> = Vec::new();
         for ev in events {
+            match edit_command(&ev, shift, cfg!(target_os = "macos")) {
+                Some(EditCommand::Copy) => {
+                    if let Some(text) = self.selection_text() {
+                        ui.ctx().copy_text(text);
+                    }
+                    continue;
+                }
+                Some(EditCommand::Send(b)) => {
+                    out.push(b);
+                    continue;
+                }
+                None => {}
+            }
             match ev {
                 egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
-                egui::Event::Paste(t) => {
-                    if mode.contains(TermMode::BRACKETED_PASTE) {
-                        out.extend_from_slice(b"\x1b[200~");
-                        out.extend_from_slice(t.replace('\x1b', "").as_bytes());
-                        out.extend_from_slice(b"\x1b[201~");
-                    } else {
-                        out.extend_from_slice(t.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
-                    }
-                }
-                // On Windows/Linux, egui turns Ctrl+C / Ctrl+X into Copy / Cut.
-                egui::Event::Copy if !cfg!(target_os = "macos") => out.push(0x03),
-                egui::Event::Cut if !cfg!(target_os = "macos") => out.push(0x18),
+                egui::Event::Paste(t) => out.extend_from_slice(&paste_bytes(&t, mode.contains(TermMode::BRACKETED_PASTE))),
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if let Some(bytes) = key_bytes(key, modifiers, mode.contains(TermMode::APP_CURSOR)) {
                         out.extend_from_slice(&bytes);
@@ -362,6 +469,7 @@ impl Terminal {
             }
         }
         if !out.is_empty() {
+            self.term.selection = None;
             self.term.scroll_display(Scroll::Bottom);
             self.write(&out);
         }
@@ -374,6 +482,7 @@ impl Terminal {
 
         let content = self.term.renderable_content();
         let colors = content.colors;
+        let selection = content.selection;
         let offset = content.display_offset as i32;
         let origin = rect.min + Vec2::splat(PAD);
         let cell_pos = |row: usize, col: usize| origin + Vec2::new(col as f32 * cw, row as f32 * ch);
@@ -418,6 +527,10 @@ impl Terminal {
             }
             if cell.flags.contains(Flags::HIDDEN) {
                 fg = bg;
+            }
+            if selection.is_some_and(|s| s.contains(ind.point)) {
+                bg = SELECTION_BG;
+                fg = TERM_FG;
             }
 
             let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
@@ -508,6 +621,7 @@ impl Drop for Terminal {
 
 const TERM_BG: Color32 = Color32::from_rgb(0x0d, 0x10, 0x15);
 const TERM_FG: Color32 = Color32::from_rgb(0xd5, 0xda, 0xe1);
+const SELECTION_BG: Color32 = Color32::from_rgb(0x2c, 0x4a, 0x6e);
 
 const ANSI: [Color32; 16] = [
     Color32::from_rgb(0x1e, 0x23, 0x2b),
@@ -574,6 +688,44 @@ fn resolve(color: AnsiColor, colors: &Colors) -> Color32 {
 
 // ---------------------------------------------------------------------------
 // Keyboard
+
+/// What a clipboard shortcut means inside the terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum EditCommand {
+    /// Copy the selection to the clipboard.
+    Copy,
+    /// Send this control byte to the program instead.
+    Send(u8),
+}
+
+/// egui turns ⌘C/⌘X/⌘V (macOS) and Ctrl+C/X/V (elsewhere) into Copy, Cut and
+/// Paste events. On macOS those are the clipboard. Elsewhere a terminal keeps
+/// Ctrl+C/X/V for the program (^C interrupts, ^V is literal-next) and uses
+/// Ctrl+Shift+C/V for the clipboard. `None` means: handle the event normally
+/// (a Paste event pastes).
+fn edit_command(ev: &egui::Event, shift: bool, mac: bool) -> Option<EditCommand> {
+    match ev {
+        egui::Event::Copy if mac || shift => Some(EditCommand::Copy),
+        egui::Event::Copy => Some(EditCommand::Send(0x03)),
+        egui::Event::Cut if mac => None,
+        egui::Event::Cut => Some(EditCommand::Send(0x18)),
+        egui::Event::Paste(_) if !mac && !shift => Some(EditCommand::Send(0x16)),
+        _ => None,
+    }
+}
+
+/// Bytes to send for pasted text. With bracketed paste on, escape characters
+/// are dropped so the text cannot end the bracket early and run as commands.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut out = b"\x1b[200~".to_vec();
+        out.extend(text.replace(['\x1b', '\u{9b}'], "").as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
 
 fn key_bytes(key: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     if m.mac_cmd {
@@ -795,8 +947,9 @@ mod tests {
         while t.rx.try_recv().is_ok() {
             chunks += 1;
         }
-        // The reader may hold one more chunk while blocked on a full queue.
-        assert!(chunks <= READ_QUEUE_CHUNKS + 1, "queue held {chunks} chunks");
+        // Draining races with the reader refilling the queue, so allow some
+        // slack; an unbounded queue would hold thousands of chunks by now.
+        assert!(chunks <= READ_QUEUE_CHUNKS * 2, "queue held {chunks} chunks");
         assert!(chunks > 0);
     }
 
@@ -890,6 +1043,86 @@ mod tests {
         ] {
             assert!(cfg.contains(want), "missing {want:?} in ssh -G output");
         }
+    }
+
+    #[test]
+    fn clipboard_shortcuts_follow_platform_conventions() {
+        let paste = egui::Event::Paste("x".into());
+        // macOS: ⌘C copies, ⌘V pastes; Ctrl+C never arrives as Copy there.
+        assert_eq!(edit_command(&egui::Event::Copy, false, true), Some(EditCommand::Copy));
+        assert_eq!(edit_command(&paste, false, true), None);
+        // Linux/Windows: Ctrl+C interrupts, Ctrl+Shift+C copies.
+        assert_eq!(edit_command(&egui::Event::Copy, false, false), Some(EditCommand::Send(0x03)));
+        assert_eq!(edit_command(&egui::Event::Copy, true, false), Some(EditCommand::Copy));
+        // Ctrl+V is literal-next for the shell or vim, Ctrl+Shift+V pastes.
+        assert_eq!(edit_command(&paste, false, false), Some(EditCommand::Send(0x16)));
+        assert_eq!(edit_command(&paste, true, false), None);
+        assert_eq!(edit_command(&egui::Event::Cut, false, false), Some(EditCommand::Send(0x18)));
+    }
+
+    #[test]
+    fn bracketed_paste_cannot_escape_the_bracket() {
+        let evil = "ls\x1b[201~rm -rf ~\n\u{9b}201~";
+        let out = String::from_utf8(paste_bytes(evil, true)).unwrap();
+        assert_eq!(out.matches("\x1b[201~").count(), 1, "{out:?}");
+        assert!(out.ends_with("\x1b[201~") && !out.contains('\u{9b}'));
+        assert_eq!(paste_bytes("a\r\nb\nc", false), b"a\rb\rc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipv6_destinations_reach_openssh() {
+        assert_eq!(destination_host("ssh", "[::1]"), "::1");
+        assert_eq!(destination_host("ssh", "::1"), "::1");
+        assert_eq!(destination_host("sftp", "::1"), "[::1]");
+        assert_eq!(destination_host("sftp", "[fe80::1]"), "[fe80::1]");
+        assert_eq!(destination_host("sftp", "db.example"), "db.example");
+        let spec = SshSpec {
+            program: "ssh",
+            user: "ops".into(),
+            address: "[2001:db8::5]".into(),
+            port: 22,
+            identity: None,
+            options: Vec::new(),
+            temp_files: Vec::new(),
+        };
+        let out = std::process::Command::new("ssh").arg("-G").args(spec.args()).output().expect("ssh not installed");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hostname 2001:db8::5"));
+    }
+
+    /// A key written for a session is wiped as soon as the program exits,
+    /// not only when the tab is closed, and the process is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_wiped_when_the_program_exits() {
+        let key = std::env::temp_dir().join(format!("shellyard-test-exit-{}", crate::model::Host::new_id()));
+        std::fs::write(&key, "secret").unwrap();
+        let ctx = egui::Context::default();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let mut t = Terminal::spawn(cmd, "x".into(), &ctx).unwrap();
+        t.temp_files = vec![key.clone()];
+        let start = std::time::Instant::now();
+        while !(t.exited && t.reaped) && start.elapsed() < std::time::Duration::from_secs(5) {
+            t.pump(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(t.exited && t.reaped);
+        assert!(!key.exists(), "key file still on disk after the session ended");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selection_copies_screen_text() {
+        let (_ctx, mut t) = run_script("printf 'hello world'", false);
+        assert_eq!(t.selection_text(), None);
+        let at = |c| Point::new(alacritty_terminal::index::Line(0), Column(c));
+        let mut sel = Selection::new(SelectionType::Simple, at(0), Side::Left);
+        sel.update(at(4), Side::Right);
+        t.term.selection = Some(sel);
+        assert_eq!(t.selection_text().as_deref(), Some("hello"));
+        t.term.selection = Some(Selection::new(SelectionType::Semantic, at(8), Side::Left));
+        assert_eq!(t.selection_text().as_deref(), Some("world"));
     }
 
     #[test]

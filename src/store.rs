@@ -68,12 +68,17 @@ fn save_to(path: &std::path::Path, password: &str, inventory: &Inventory) -> Res
     let json = Zeroizing::new(serde_json::to_vec(inventory)?);
     let blob = vault::seal(password, &json)?;
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        // Make the folder private only if Shellyard creates it: SHELLYARD_VAULT
+        // may point into a folder the user owns for other reasons (Documents, a
+        // synced folder), and its permissions are theirs to choose.
+        if !dir.exists() {
+            std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
     let tmp = path.with_extension("vault.tmp");
@@ -101,12 +106,24 @@ fn run_dir() -> PathBuf {
 /// Writes a key from the vault to a private file (0600, in a 0700 directory)
 /// so OpenSSH can read it. The caller must remove it with [`remove_temp_files`].
 pub fn write_temp_key(contents: &str, public: Option<&str>) -> Result<Vec<PathBuf>> {
-    let dir = run_dir();
-    std::fs::create_dir_all(&dir)?;
+    write_temp_key_in(&run_dir(), contents, public)
+}
+
+fn write_temp_key_in(dir: &std::path::Path, contents: &str, public: Option<&str>) -> Result<Vec<PathBuf>> {
+    let dir = dir.to_path_buf();
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    // Never follow a symlink here: someone who can write to the vault folder
+    // could otherwise point `run` at a folder they can read.
+    let meta = std::fs::symlink_metadata(&dir)?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("{} is not a plain directory; refusing to write a key there", dir.display());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        // Fails unless this user owns the directory.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot make {} private", dir.display()))?;
     }
     let name = crate::model::Host::new_id();
     let path = dir.join(format!("key-{name}"));
@@ -175,8 +192,7 @@ mod tests {
     #[test]
     fn temp_key_is_private_and_removed() {
         let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
-        std::env::set_var("SHELLYARD_VAULT", dir.join("v.vault"));
-        let files = write_temp_key("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----", Some("ssh-ed25519 AAAA test")).unwrap();
+        let files = write_temp_key_in(&dir.join("run"), "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----", Some("ssh-ed25519 AAAA test")).unwrap();
         assert_eq!(files.len(), 2);
         #[cfg(unix)]
         {
@@ -217,6 +233,34 @@ mod tests {
         let back = load_from(&path, "a long test password").unwrap();
         assert_eq!(back.hosts.len(), inv.hosts.len());
         assert!(load_from(&path, "wrong password!!").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// SHELLYARD_VAULT may point into a folder the user owns (Documents, a
+    /// synced folder): saving must not change that folder's permissions.
+    #[cfg(unix)]
+    #[test]
+    fn existing_vault_folder_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        save_to(&dir.join("t.vault"), "a long test password", &Inventory::default()).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(dir.join("t.vault")).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `run` symlink planted in a shared vault folder must not receive keys.
+    #[cfg(unix)]
+    #[test]
+    fn temp_key_refuses_symlinked_run_dir() {
+        let dir = std::env::temp_dir().join(format!("shellyard-test-{}", crate::model::Host::new_id()));
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join("run")).unwrap();
+        assert!(write_temp_key_in(&dir.join("run"), "-----BEGIN OPENSSH PRIVATE KEY-----", None).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "a key was written through the symlink");
         let _ = std::fs::remove_dir_all(dir);
     }
 
