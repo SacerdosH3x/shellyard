@@ -31,8 +31,9 @@ entry. You can [read it first](install.sh). Uninstall with
 **Homebrew:**
 
 ```sh
-brew trust sacerdosh3x/tap        # once: Homebrew asks before using a third-party tap
-brew install sacerdosh3x/tap/shellyard
+brew trust sacerdosh3x/tap                      # once: Homebrew asks before using a third-party tap
+brew install --cask sacerdosh3x/tap/shellyard   # macOS: Shellyard.app in /Applications
+brew install sacerdosh3x/tap/shellyard          # Linux
 ```
 
 **From source** (Rust stable):
@@ -54,13 +55,14 @@ On Debian/Ubuntu run `scripts/linux-deps.sh` first.
 - **Hosts:** folders, favorites, tags, search, command palette (⌘⇧P), recent connections.
 - **Terminals:** SSH, SFTP and local shells in tabs, with truecolor, scrollback, mouse selection and copy, and bracketed paste.
 - **Credentials:** user names, passwords, SSH keys and key passphrases, reusable across hosts; a host can also have its own password. Saved secrets are handed to OpenSSH only when it asks for them. Generate ed25519 keys and install them with `ssh-copy-id`.
-- **RDP:** opens Windows hosts in FreeRDP (signing in with the saved password) or Windows App / Remmina.
+- **RDP in a tab:** Windows desktops open inside Shellyard (built on IronRDP), sign in with the saved password, and resize with the tab. The server certificate is pinned on first connect. FreeRDP, Windows App or Remmina can be used instead.
+- **Split panes:** several terminals per tab, tmux shortcuts (Ctrl+B then `%` `"` arrows `o` `x` `z` `{` `}` `!`), draggable dividers, drag a pane's title bar onto another to swap them.
 - **Tunnels:** local (`-L`), remote (`-R`) and SOCKS (`-D`) forwards with start/stop, status, a console for prompts, and auto-start.
 - **Notes:** encrypted notes and command snippets, linked to hosts, pasted into a terminal with one click.
 - **Security:** auto-lock when idle, secrets wiped from memory, OSC 52 clipboard writes blocked by default.
 
-Planned: split panes and broadcast input, a graphical SFTP browser, jump hosts,
-Docker, encrypted backup and sync. See
+Planned: broadcast input to panes, a graphical SFTP browser, jump hosts, RDP
+clipboard and sound, Docker, encrypted backup and sync. See
 [docs/PLAN.md](docs/PLAN.md).
 
 ## Security

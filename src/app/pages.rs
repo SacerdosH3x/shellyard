@@ -845,7 +845,7 @@ impl App {
                 });
                 return;
             };
-            let sessions: Vec<(usize, String)> = self.sessions.iter().enumerate().map(|(i, s)| (i, s.label.clone())).collect();
+            let sessions: Vec<(usize, String)> = self.sessions.iter().enumerate().map(|(i, s)| (i, s.label())).collect();
             let mut changed = false;
             let mut delete = false;
             let note = &mut self.inventory.notes[idx];

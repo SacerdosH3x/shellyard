@@ -79,6 +79,9 @@ pub struct Host {
     /// Port for RDP; `port` is the SSH/SFTP port.
     #[serde(default = "default_rdp_port")]
     pub rdp_port: u16,
+    /// SHA-256 of the RDP server's certificate, accepted on first connect.
+    #[serde(default)]
+    pub rdp_fingerprint: Option<String>,
 }
 
 pub fn default_rdp_port() -> u16 {
@@ -343,19 +346,46 @@ pub struct Settings {
     pub allow_osc52: bool,
     /// Which program opens RDP connections.
     pub rdp_client: RdpClient,
+    /// tmux-style prefix for pane shortcuts.
+    pub pane_prefix: PanePrefix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PanePrefix {
+    #[default]
+    CtrlB,
+    CtrlA,
+    Off,
+}
+
+impl PanePrefix {
+    pub const ALL: [PanePrefix; 3] = [PanePrefix::CtrlB, PanePrefix::CtrlA, PanePrefix::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PanePrefix::CtrlB => "Ctrl+B (tmux default)",
+            PanePrefix::CtrlA => "Ctrl+A (screen style)",
+            PanePrefix::Off => "Off",
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_lock_minutes: 15, allow_osc52: false, rdp_client: RdpClient::Auto }
+        Self { auto_lock_minutes: 15, allow_osc52: false, rdp_client: RdpClient::Builtin, pane_prefix: PanePrefix::CtrlB }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RdpClient {
+    /// Shellyard's own client, inside a tab. Vaults saved before it existed
+    /// say "Auto" (which then meant an external client); they get this.
+    #[default]
+    #[serde(alias = "Auto")]
+    Builtin,
     /// FreeRDP when a password is saved (it can sign in with it), otherwise
     /// the system's RDP app.
-    #[default]
+    #[serde(rename = "ExternalAuto")]
     Auto,
     /// FreeRDP (xfreerdp / sdl-freerdp) in a terminal tab.
     FreeRdp,
@@ -364,11 +394,12 @@ pub enum RdpClient {
 }
 
 impl RdpClient {
-    pub const ALL: [RdpClient; 3] = [RdpClient::Auto, RdpClient::FreeRdp, RdpClient::System];
+    pub const ALL: [RdpClient; 4] = [RdpClient::Builtin, RdpClient::Auto, RdpClient::FreeRdp, RdpClient::System];
 
     pub fn label(self) -> &'static str {
         match self {
-            RdpClient::Auto => "Automatic",
+            RdpClient::Builtin => "Built-in (in a tab)",
+            RdpClient::Auto => "External, automatic",
             RdpClient::FreeRdp => "FreeRDP",
             RdpClient::System => if cfg!(target_os = "macos") { "Windows App" } else { "Remmina" },
         }
@@ -417,6 +448,7 @@ fn host(name: &str, address: &str, user: &str, folder: &str, kind: HostKind, fav
         credential_id: None,
         password: None,
         rdp_port: default_rdp_port(),
+        rdp_fingerprint: None,
     }
 }
 

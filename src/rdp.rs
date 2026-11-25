@@ -73,7 +73,7 @@ pub fn launch(t: &Target, client: RdpClient, run_dir: &std::path::Path) -> Resul
     let use_freerdp = match client {
         RdpClient::FreeRdp => true,
         RdpClient::System => false,
-        RdpClient::Auto => freerdp.is_some() && (t.password.is_some() || !system_available()),
+        RdpClient::Auto | RdpClient::Builtin => freerdp.is_some() && (t.password.is_some() || !system_available()),
     };
     if use_freerdp {
         let f = freerdp.ok_or_else(|| anyhow!("FreeRDP is not installed ({})", install_hint()))?;

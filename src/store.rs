@@ -355,6 +355,17 @@ mod tests {
         assert!(json.contains("\"credentials\"") && json.contains("\"credential_id\"") && !json.contains("\"keys\""));
     }
 
+    /// 0.1.0-beta.2 saved `"rdp_client":"Auto"` (an external window); RDP now
+    /// opens in a tab unless an external client is picked again.
+    #[test]
+    fn old_rdp_setting_opens_rdp_in_a_tab() {
+        let st: crate::model::Settings = serde_json::from_str(r#"{"rdp_client":"Auto"}"#).unwrap();
+        assert_eq!(st.rdp_client, crate::model::RdpClient::Builtin);
+        let ext = serde_json::to_string(&crate::model::Settings { rdp_client: crate::model::RdpClient::Auto, ..Default::default() }).unwrap();
+        let back: crate::model::Settings = serde_json::from_str(&ext).unwrap();
+        assert_eq!(back.rdp_client, crate::model::RdpClient::Auto, "{ext}");
+    }
+
     #[test]
     fn secrets_are_redacted_in_debug_output() {
         let mut inv = Inventory::sample();

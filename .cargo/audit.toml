@@ -8,4 +8,11 @@ ignore = [
     # parses XML at run time. Remove when egui/accesskit move to quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # rsa 0.10.0-rc.18 (Marvin attack: timing side channel when DECRYPTING with
+    # an RSA private key). Pulled in by IronRDP (picky, sspi pin =0.10.0-rc.18,
+    # also in IronRDP's newest release). The RDP client never decrypts with a
+    # private key of its own: it only encrypts to the server's public key and
+    # parses certificates; sign-in is NTLM (no smartcard, no Kerberos PKINIT).
+    # Remove when picky/sspi move to rsa >= 0.10.0.
+    "RUSTSEC-2023-0071",
 ]

@@ -90,9 +90,9 @@ main() {
 
   local asset="shellyard-${version#v}-$platform.tar.gz"
   local base="https://github.com/$REPO/releases/download/$version"
-  local tmp
+  # Global (not local): the EXIT trap runs after main has returned.
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "${tmp:-}"' EXIT
 
   say "Downloading Shellyard $version ($platform)"
   curl -fSL --progress-bar "$base/$asset" -o "$tmp/$asset" || die "download failed: $base/$asset"

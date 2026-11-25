@@ -2,6 +2,7 @@ mod app;
 mod askpass;
 mod model;
 mod rdp;
+mod rdp_view;
 mod store;
 mod terminal;
 mod theme;

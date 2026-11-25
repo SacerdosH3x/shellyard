@@ -75,6 +75,14 @@ pub struct Terminal {
     pub allow_clipboard: bool,
     /// The process has been waited for (no zombie left behind).
     reaped: bool,
+    /// Print "[exited with code N] Press Enter to reconnect" when the program
+    /// ends (off for tunnels, whose console shows the program's last words).
+    pub exit_notice: bool,
+    exit_code: Option<u32>,
+    exited_at: Option<std::time::Instant>,
+    notice_shown: bool,
+    /// Enter was pressed after the program ended: the owner restarts it.
+    pub restart_requested: bool,
     /// Answers OpenSSH's password/passphrase prompts with saved secrets.
     #[cfg(unix)]
     askpass: Option<crate::askpass::Server>,
@@ -205,6 +213,11 @@ impl Terminal {
             temp_files: Vec::new(),
             allow_clipboard: false,
             reaped: false,
+            exit_notice: true,
+            exit_code: None,
+            exited_at: None,
+            notice_shown: false,
+            restart_requested: false,
             #[cfg(unix)]
             askpass: None,
         })
@@ -320,12 +333,49 @@ impl Terminal {
             crate::store::remove_temp_files(&std::mem::take(&mut self.temp_files));
         }
         if !self.reaped {
-            self.reaped = matches!(self.child.try_wait(), Ok(Some(_)) | Err(_));
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    self.exit_code = Some(status.exit_code());
+                }
+                Ok(None) => {}
+                Err(_) => self.reaped = true,
+            }
         }
         #[cfg(unix)]
         {
             self.askpass = None;
         }
+        let since = *self.exited_at.get_or_insert_with(std::time::Instant::now);
+        // Wait briefly for the exit code; a program that outlives its terminal gets the notice anyway.
+        if self.exit_notice && !self.notice_shown && (self.reaped || since.elapsed() > std::time::Duration::from_secs(1)) {
+            self.notice_shown = true;
+            let what = match self.exit_code {
+                Some(0) => "Session ended".to_string(),
+                Some(code) => format!("Session ended with exit code {code}"),
+                None => "Session ended".to_string(),
+            };
+            // Leave a full-screen program's screen, reset colors, then say so on a fresh line.
+            let notice = format!("\x1b[?1049l\x1b[0m\r\n\x1b[2m[{what}. Press Enter to reconnect, or close the tab.]\x1b[0m\r\n");
+            self.feed(notice.as_bytes());
+        }
+    }
+
+    /// Writes text into the terminal as if the program had printed it.
+    fn feed(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// A tab for a connection that could not start: shows the error, and
+    /// Enter tries again (see `restart_requested`).
+    pub fn failed(title: String, error: &str, ctx: &egui::Context) -> Result<Self> {
+        let mut t = Self::spawn(CommandBuilder::new("true"), title, ctx)?;
+        t.exited = true;
+        t.notice_shown = true;
+        // The error text comes from host names and OS messages: drop control characters.
+        let clean: String = error.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        t.feed(format!("\x1b[31m{} {clean}\x1b[0m\r\n\r\n\x1b[2m[Press Enter to try again, or close the tab.]\x1b[0m\r\n", egui_phosphor::regular::WARNING_CIRCLE).as_bytes());
+        Ok(t)
     }
 
     /// The selected text, if any.
@@ -489,6 +539,18 @@ impl Terminal {
         let (events, shift) = ui.input(|i| (i.events.clone(), i.modifiers.shift));
         let mut out: Vec<u8> = Vec::new();
         for ev in events {
+            if self.exited {
+                // Ended: the tab still scrolls and copies; Enter starts it again.
+                if matches!(ev, egui::Event::Key { key: Key::Enter, pressed: true, .. }) {
+                    self.restart_requested = true;
+                }
+                if edit_command(&ev, shift, cfg!(target_os = "macos")) == Some(EditCommand::Copy) {
+                    if let Some(text) = self.selection_text() {
+                        ui.ctx().copy_text(text);
+                    }
+                }
+                continue;
+            }
             match edit_command(&ev, shift, cfg!(target_os = "macos")) {
                 Some(EditCommand::Copy) => {
                     if let Some(text) = self.selection_text() {
@@ -642,15 +704,6 @@ impl Terminal {
             }
         }
 
-        if self.exited {
-            let msg = "Session ended. Close this tab or reconnect.";
-            let pos = Pos2::new(rect.center().x, rect.bottom() - 28.0);
-            let g = painter.layout_no_wrap(msg.into(), FontId::proportional(13.0), theme::TEXT);
-            let bg = Rect::from_center_size(pos, g.size() + Vec2::new(24.0, 12.0));
-            painter.rect_filled(bg, 6.0, theme::SURFACE);
-            painter.rect_stroke(bg, 6.0, Stroke::new(1.0_f32, theme::BORDER));
-            painter.galley(bg.min + Vec2::new(12.0, 6.0), g, theme::TEXT);
-        }
     }
 }
 
@@ -1156,6 +1209,25 @@ mod tests {
         }
         assert!(t.exited && t.reaped);
         assert!(!key.exists(), "key file still on disk after the session ended");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ended_sessions_say_so_and_failed_ones_show_the_error() {
+        let (_ctx, mut t) = run_script("exit 3", false);
+        let start = std::time::Instant::now();
+        while !t.notice_shown && start.elapsed() < std::time::Duration::from_secs(3) {
+            t.pump(&_ctx);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let text = screen_text(&t);
+        assert!(text.contains("Session ended with exit code 3. Press Enter to reconnect"), "{text:?}");
+
+        let ctx = egui::Context::default();
+        let t = Terminal::failed("x".into(), "key file /k not found\x1b]52;c;evil\x07", &ctx).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("key file /k not found") && text.contains("Press Enter to try again"), "{text:?}");
+        assert!(t.exited);
     }
 
     #[cfg(unix)]

@@ -55,7 +55,16 @@ Shellyard starts `ssh` with `SSH_ASKPASS=<the Shellyard executable>` and
 - Each secret is given at most once per session. A wrong one makes OpenSSH ask again, and that prompt, like every other one (host-key confirmation, one-time codes, new-password prompts), is asked in the terminal tab with echo off. Nothing loops or can lock an account.
 - Without a saved secret, OpenSSH is started exactly as before and prompts in the terminal.
 
-RDP: FreeRDP 3 gets its arguments, including the password, through
+Built-in RDP (default): IronRDP's own TLS layer accepts any server
+certificate, so Shellyard pins it instead ([src/rdp_view.rs](../src/rdp_view.rs)).
+After the TLS handshake and before CredSSP sends anything derived from the
+password, the certificate's SHA-256 fingerprint is compared with the one saved
+on the host. A first connection shows the fingerprint and waits; a changed one
+shows a warning and waits; Cancel ends the connection with nothing sent. An
+accepted fingerprint is stored in the vault. Sign-in is NTLM (no Kerberos KDC
+lookups, so no other network traffic); audio and clipboard are not redirected.
+
+External RDP: FreeRDP 3 gets its arguments, including the password, through
 `/args-from:env:` (an environment variable only this user can read), never on
 the command line. FreeRDP 2 and the system apps (Windows App, Remmina) ask for
 the password themselves; the `.rdp` file written for Windows App holds only the
@@ -73,7 +82,7 @@ tab; Shellyard does not turn that check off.
 
 **Static**
 - `cargo clippy --all-targets`: 0 warnings. A pedantic pass found style issues only.
-- `cargo audit` (RustSec): 2 advisories, both in `quick-xml` 0.30 (RUSTSEC-2026-0194, -0195, denial of service on hostile XML). It comes in only on Linux, via `eframe → accesskit_unix → atspi-common → zbus-lockstep`, which runs in atspi's proc macros and tests at compile time on the XML files shipped with that crate; Shellyard never parses XML at run time. Both are ignored in [.cargo/audit.toml](../.cargo/audit.toml) with this reason, until egui/accesskit move to `quick-xml` ≥ 0.41. Also 8 "unmaintained" warnings (`paste`, `ttf-parser`, `zbus_names`, `zvariant`), no vulnerabilities. CI runs `cargo audit` on every push.
+- `cargo audit` (RustSec): 2 advisories, both in `quick-xml` 0.30 (RUSTSEC-2026-0194, -0195, denial of service on hostile XML). It comes in only on Linux, via `eframe → accesskit_unix → atspi-common → zbus-lockstep`, which runs in atspi's proc macros and tests at compile time on the XML files shipped with that crate; Shellyard never parses XML at run time. Both are ignored in [.cargo/audit.toml](../.cargo/audit.toml) with this reason, until egui/accesskit move to `quick-xml` ≥ 0.41. Since the built-in RDP client: RUSTSEC-2023-0071 in `rsa` 0.10.0-rc.18 (Marvin attack, a timing side channel when decrypting with an RSA private key), pinned by IronRDP's `picky` and `sspi`, including IronRDP's newest release. Shellyard's RDP client never decrypts with a private key of its own (it encrypts to the server's public key and parses certificates; sign-in is NTLM, no smartcard or PKINIT), so it is ignored with this reason until those crates move to `rsa` ≥ 0.10.0. Also "unmaintained" warnings (`paste`, `ttf-parser`, `zbus_names`, `zvariant`), no vulnerabilities. CI runs `cargo audit` on every push.
 - The project contains no `unsafe` code.
 - Manual review of vault, storage, SSH argument building, temp key files, terminal event handling and forms.
 
@@ -84,7 +93,8 @@ tab; Shellyard does not turn that check off.
 - SSH: generated arguments (including IPv6) are checked with real `ssh -G`; option injection is rejected.
 - Askpass: real OpenSSH (`ssh-keygen -y`) runs the real binary as askpass and unlocks a passphrase-protected key through the socket; a wrong secret fails; a wrong token gets nothing; prompts for other hosts, other keys, yes/no and new passwords are refused; each secret is given once; the socket folder is 0700 and removed.
 - Vault: version 2 vaults (`keys`, `key_id`) load as credentials; passwords and passphrases are not in the file in plaintext and are redacted in debug output.
-- RDP: the password never appears in FreeRDP's argv; the installed FreeRDP parses the generated arguments.
+- RDP: the password never appears in FreeRDP's argv; the installed FreeRDP parses the generated arguments. Built-in client: an unreachable server ends with an error before any prompt; fingerprints, scancodes, domain parsing and desktop sizes are unit-tested. It has not been run against a live Windows server in CI.
+- Panes: splitting, closing, swapping, resizing and moving focus are tested on the layout tree.
 - App launch with a throwaway vault: starts, no errors, stale `key-*` file removed and other files kept.
 
 ## Bugs fixed by this review

@@ -40,11 +40,11 @@ See [SECURITY.md](SECURITY.md) for the threat model, the analysis results and kn
    - *Still to do:* jump hosts (ProxyJump) in the host editor, reconnect without a new process.
 4b. **Tunnels (done):** local (-L), remote (-R) and SOCKS (-D) forwards run as `ssh -N` with ExitOnForwardFailure and keepalives; start/stop, status, live console for passphrase prompts, auto-start on unlock.
 4c. **Notes (done):** notes in the vault, optionally linked to a host, searchable, paste into a terminal tab.
-5. **Tabs and panes (partial):** tabs, reconnect, keyboard shortcuts. *Still to do:* split up to 16 panes, broadcast input.
+5. **Tabs and panes (done):** tabs, split panes with tmux shortcuts, drag to resize and swap, zoom, move a pane to its own tab, Enter reconnects an ended pane. *Still to do:* broadcast input, saved layouts.
 6. **SFTP:** dual-pane browser, drag-and-drop transfers, chmod, inline editor, live tail. (Today: the `sftp` CLI in a tab.)
 7. **Organize and personalize (partial):** host editor (folder, type, tags, protocols, favorite), command palette. *Still to do:* drag-and-drop folders, custom colors and icons, themes, keybinding editor, PuTTY/WinSCP/MobaXterm import.
 8. **Backup:** encrypted export and import, Git or cloud-folder sync of ciphertext.
-9. **RDP (done, external client):** FreeRDP in a tab (signs in with the saved password, asks about certificates there), or Windows App on macOS / Remmina on Linux. Picked in Settings → Remote desktop.
+9. **RDP (done):** built-in client in a tab (IronRDP: picture, keyboard, mouse, wheel, live resize, pinned certificate), or FreeRDP / Windows App / Remmina. *Still to do:* clipboard, sound, drive redirection, RD Gateway.
 10. **Later:** Docker management, auto-update. The Docker page is a placeholder in the UI.
 
 ## Running
