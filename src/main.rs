@@ -12,7 +12,9 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1320.0, 840.0])
         .with_min_inner_size([860.0, 520.0])
-        .with_title("Shellyard");
+        .with_title("Shellyard")
+        // Wayland app id / X11 class: matches packaging/linux/shellyard.desktop.
+        .with_app_id("shellyard");
     if cfg!(target_os = "macos") {
         // Draw our own top bar under the traffic-light buttons.
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
