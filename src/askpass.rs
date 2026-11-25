@@ -354,9 +354,31 @@ mod unix {
                 unsafe { cmd.pre_exec(|| (libc::setsid() != -1).then_some(()).ok_or_else(std::io::Error::last_os_error)) };
                 cmd.output().unwrap()
             };
+            // What this ssh-keygen asks: newer versions name the key file
+            // (`Enter passphrase for "<path>":`), older ones (8.9) do not.
+            let probe = dir.join("probe.sh");
+            std::fs::write(&probe, format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nexit 1\n", dir.join("prompt").display())).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let _ = std::process::Command::new("ssh-keygen")
+                .arg("-y")
+                .arg("-f")
+                .arg(&key)
+                .env("SSH_ASKPASS", &probe)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let prompt = std::fs::read_to_string(dir.join("prompt")).unwrap_or_default();
             let out = run("pp-secret-1");
-            assert!(String::from_utf8_lossy(&out.stdout).starts_with("ssh-ed25519 "), "{out:?}");
-            assert!(!run("wrong").status.success(), "a wrong passphrase must not unlock the key");
+            if prompt.contains(&*key.to_string_lossy()) {
+                assert!(String::from_utf8_lossy(&out.stdout).starts_with("ssh-ed25519 "), "{out:?}");
+                assert!(!run("wrong").status.success(), "a wrong passphrase must not unlock the key");
+            } else {
+                // A prompt that does not name our key must not get the passphrase.
+                assert!(!out.status.success() && out.stdout.is_empty(), "passphrase given to {prompt:?}: {out:?}");
+            }
             let _ = std::fs::remove_dir_all(dir);
         }
 
